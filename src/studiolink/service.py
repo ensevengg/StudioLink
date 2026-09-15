@@ -5,21 +5,22 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from studiolink.ollama_adapter import OllamaAdapter
-from studiolink.lmstudio_adapter import LMStudioAdapter
 from studiolink.config import StudioLinkConfig
+from studiolink.lmstudio_adapter import LMStudioAdapter
 from studiolink.models import (
     DoctorCheck,
     ImportMode,
-    is_synced,
     LinkMode,
     ModelReadiness,
     OllamaModel,
+    OllamaScanReport,
     PruneReport,
     PruneResult,
     SyncRecord,
     SyncResult,
+    is_synced,
 )
+from studiolink.ollama_adapter import OllamaAdapter
 from studiolink.state import StateStore
 from studiolink.syncer import Syncer, same_file
 
@@ -59,12 +60,16 @@ class StudioLinkService:
         self.state = StateStore(self.config.state_file)
 
     def scan(self) -> list[OllamaModel]:
+        report = self.scan_report()
+        return list(report.models)
+
+    def scan_report(self) -> OllamaScanReport:
         logger.debug(
             "Scanning Ollama manifests at %s", self.config.ollama_manifests_dir
         )
-        models = self.ollama.scan_models()
-        logger.debug("Discovered %d model(s)", len(models))
-        return models
+        report = self.ollama.scan_report()
+        logger.debug("Discovered %d model(s)", len(report.models))
+        return report
 
     def status(self) -> list[StatusEntry]:
         models = self.scan()
@@ -72,7 +77,7 @@ class StudioLinkService:
         return [
             StatusEntry(
                 model=model,
-                synced=is_synced(model, records.get(model.canonical_name)),
+                synced=self._record_is_synced(model, records.get(model.canonical_name)),
                 sync_record=records.get(model.canonical_name),
             )
             for model in models
@@ -111,16 +116,35 @@ class StudioLinkService:
         return syncer.sync(selected, mode, import_mode, dry_run)
 
     def prune(self, *, dry_run: bool = False) -> PruneReport:
-        """Remove staging aliases and sync records for models Ollama no longer has.
+        """Safely remove unneeded aliases and stale sync records.
 
-        Hard-linked aliases keep deleted Ollama blobs alive on disk; this is
-        the only way to reclaim that space.
+        Destructive work requires a complete Ollama scan, and aliases needed
+        by symbolic LM Studio imports are preserved.
         """
-        models = self.scan()
+        scan = self.scan_report()
+        if not scan.source_available:
+            details = "; ".join(scan.errors) or "source is unavailable"
+            raise RuntimeError(f"Ollama library could not be scanned: {details}")
+        if not scan.complete:
+            details = "; ".join(scan.errors) or "unknown scan error"
+            raise RuntimeError(f"Ollama manifest scan was incomplete: {details}")
+
+        models = list(scan.models)
         expected: dict[str, OllamaModel] = {
             model.import_filename: model
             for model in models
             if model.readiness is ModelReadiness.READY and model.blob_path is not None
+        }
+        records = self.state.get_all_records()
+        unready_names = {
+            model.canonical_name
+            for model in models
+            if model.readiness is not ModelReadiness.READY
+        }
+        protected_aliases = {
+            record.import_alias_path
+            for name, record in records.items()
+            if record.link_mode is LinkMode.SYMBOLIC_LINK or name in unready_names
         }
 
         alias_results: list[PruneResult] = []
@@ -128,6 +152,9 @@ class StudioLinkService:
         if staging.exists():
             for path in sorted(staging.iterdir()):
                 if not path.is_file():
+                    continue
+                if path in protected_aliases:
+                    logger.debug("Preserving required import alias: %s", path)
                     continue
                 model = expected.get(path.name)
                 if model is not None and same_file(path, model.blob_path or path):
@@ -159,20 +186,20 @@ class StudioLinkService:
                     )
                 )
 
-        # Only prune records when Ollama's library is visible; an empty scan
-        # usually means the models dir is misconfigured, not that everything
-        # was removed.
-        records_removed: tuple[str, ...] = ()
-        if models:
-            known = {model.canonical_name for model in models}
-            records = self.state.get_all_records()
-            stale_names = sorted(
-                name for name in records if name not in known
-            )
-            if stale_names and not dry_run:
-                for name in stale_names:
-                    self.state.remove(name)
-            records_removed = tuple(stale_names)
+        known = {model.canonical_name for model in models}
+        stale_names = sorted(
+            name
+            for name, record in records.items()
+            if name not in known and record.link_mode is not LinkMode.SYMBOLIC_LINK
+        )
+        if stale_names and not dry_run:
+            remaining = {
+                name: record
+                for name, record in records.items()
+                if name not in stale_names
+            }
+            self.state.save(remaining)
+        records_removed = tuple(stale_names)
 
         logger.debug(
             "Prune complete: %d alias(es), %d record(s) (dry_run=%s)",
@@ -242,9 +269,7 @@ class StudioLinkService:
             )
         except Exception as exc:
             logger.debug("Doctor: LM Studio capabilities check failed: %s", exc)
-            checks.append(
-                DoctorCheck("lm studio import capabilities", False, str(exc))
-            )
+            checks.append(DoctorCheck("lm studio import capabilities", False, str(exc)))
 
         models = self.scan()
         checks.append(
@@ -255,9 +280,7 @@ class StudioLinkService:
             )
         )
 
-        stale_models = [
-            m for m in models if m.readiness is ModelReadiness.STALE
-        ]
+        stale_models = [m for m in models if m.readiness is ModelReadiness.STALE]
         checks.append(
             DoctorCheck(
                 "ollama blob presence",
@@ -277,13 +300,23 @@ class StudioLinkService:
             )
         )
 
-        checks.append(
-            DoctorCheck(
-                "import alias directory",
-                self.config.import_staging_dir.exists(),
-                str(self.config.import_staging_dir),
+        staging = self.config.import_staging_dir
+        if staging.exists():
+            alias_check = DoctorCheck(
+                "import alias directory", staging.is_dir(), str(staging)
             )
-        )
+        else:
+            parent = staging.parent
+            while not parent.exists() and parent != parent.parent:
+                parent = parent.parent
+            creatable = parent.is_dir() and os.access(parent, os.W_OK)
+            details = (
+                f"{staging} (will be created)"
+                if creatable
+                else f"{staging} (parent is not writable)"
+            )
+            alias_check = DoctorCheck("import alias directory", creatable, details)
+        checks.append(alias_check)
 
         return checks
 
@@ -314,6 +347,16 @@ class StudioLinkService:
         )
         return DoctorCheck("hard-link volume compatibility", ok, details)
 
+    def _record_is_synced(self, model: OllamaModel, record: SyncRecord | None) -> bool:
+        expected_target = None
+        if record is not None and record.imported_model_path is None:
+            expected_target = (
+                self.config.lmstudio_models_dir
+                / record.user_repo
+                / record.import_alias_path.name
+            )
+        return is_synced(model, record, expected_target=expected_target)
+
     def _select_models(
         self, discovered: list[OllamaModel], requested_names: list[str]
     ) -> list[OllamaModel]:
@@ -335,9 +378,7 @@ class StudioLinkService:
             matches = lookup.get(name, [])
             if not matches:
                 available = ", ".join(sorted(lookup.keys()))
-                raise ValueError(
-                    f"model not found: {name}. Available: {available}"
-                )
+                raise ValueError(f"model not found: {name}. Available: {available}")
             selected.extend(matches)
 
         return selected

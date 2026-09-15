@@ -14,9 +14,14 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from studiolink.config import StudioLinkConfig
-from studiolink.lmstudio_adapter import LMStudioError
-from studiolink.models import ImportResult, LinkMode, OllamaModel, SyncRecord
+from studiolink.config import StudioLinkConfig  # noqa: E402
+from studiolink.lmstudio_adapter import LMStudioError  # noqa: E402
+from studiolink.models import (  # noqa: E402
+    ImportResult,
+    LinkMode,
+    OllamaModel,
+    SyncRecord,
+)
 
 MODEL_MEDIA_TYPE = "application/vnd.ollama.image.model"
 DIGEST_A = "sha256:" + "a" * 64
@@ -95,9 +100,7 @@ def write_manifest(
     if content is None:
         content = {
             "schemaVersion": 2,
-            "layers": [
-                {"mediaType": MODEL_MEDIA_TYPE, "digest": digest, "size": size}
-            ],
+            "layers": [{"mediaType": MODEL_MEDIA_TYPE, "digest": digest, "size": size}],
         }
     manifest_path.write_text(json.dumps(content), encoding="utf-8")
     return manifest_path
@@ -154,6 +157,7 @@ class FakeLMStudio:
         self.calls: list[dict] = []
         self.fail_for: set[str] = set()
         self.timeout_for: set[str] = set()
+        self.models_dir: Path | None = None
 
     def get_version(self) -> str | None:
         return "0.3.17 (fake)"
@@ -186,6 +190,10 @@ class FakeLMStudio:
             )
         if source_path in self.timeout_for:
             raise subprocess.TimeoutExpired(cmd=["lms"], timeout=3600)
+        if not dry_run and self.models_dir is not None:
+            target = self.models_dir / user_repo / Path(source_path).name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(Path(source_path).read_bytes())
         return ImportResult(
             command=("lms", "import", source_path),
             stdout="",
@@ -207,6 +215,7 @@ def make_syncer(make_config, fake_lmstudio):
 
     def _make(config: StudioLinkConfig | None = None):
         cfg = config or make_config()
+        fake_lmstudio.models_dir = cfg.lmstudio_models_dir
         syncer = Syncer(cfg, fake_lmstudio, StateStore(cfg.state_file))
         return syncer, cfg, fake_lmstudio
 

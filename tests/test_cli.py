@@ -31,8 +31,15 @@ class FakeService:
         self.calls.append(("status",))
         return [StatusEntry(model=self._model, synced=False, sync_record=None)]
 
-    def sync(self, *, model_names=None, sync_all=False, link_mode=None,
-             import_mode=ImportMode.ALIAS, dry_run=False):
+    def sync(
+        self,
+        *,
+        model_names=None,
+        sync_all=False,
+        link_mode=None,
+        import_mode=ImportMode.ALIAS,
+        dry_run=False,
+    ):
         self.calls.append(
             ("sync", model_names, sync_all, link_mode, import_mode, dry_run)
         )
@@ -100,7 +107,8 @@ class TestParserMatrix:
         caplog.set_level(logging.DEBUG, logger="studiolink")
         assert cli.main(["scan", "-v"]) == 0
         debug_records = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.name == "studiolink" and r.levelno == logging.DEBUG
         ]
         assert debug_records, "expected debug logging to be enabled"
@@ -109,7 +117,8 @@ class TestParserMatrix:
         caplog.set_level(logging.DEBUG, logger="studiolink")
         assert cli.main(["-v", "scan"]) == 0
         debug_records = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.name == "studiolink" and r.levelno == logging.DEBUG
         ]
         assert debug_records, "expected debug logging to be enabled"
@@ -118,7 +127,8 @@ class TestParserMatrix:
         caplog.set_level(logging.DEBUG, logger="studiolink")
         assert cli.main(["scan"]) == 0
         debug_records = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.name == "studiolink" and r.levelno == logging.DEBUG
         ]
         assert not debug_records
@@ -162,7 +172,9 @@ class TestSyncCommand:
 
     def test_sync_error_result_exits_nonzero(self, fake_service, monkeypatch, capsys):
         def failing_sync(**kwargs):
-            return [SyncResult(model=fake_service._model, status="error", message="bad")]
+            return [
+                SyncResult(model=fake_service._model, status="error", message="bad")
+            ]
 
         monkeypatch.setattr(fake_service, "sync", failing_sync)
         assert cli.main(["sync", "llama3:1b"]) == 1
@@ -217,9 +229,7 @@ class TestPruneCommand:
 
         report = PruneReport(
             dry_run=False,
-            aliases=(
-                PruneResult(Path("old.gguf"), 1024, True, "model gone", True),
-            ),
+            aliases=(PruneResult(Path("old.gguf"), 1024, True, "model gone", True),),
             records_removed=("old:model",),
         )
         monkeypatch.setattr(fake_service, "prune", lambda *, dry_run=False: report)

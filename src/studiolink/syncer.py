@@ -11,12 +11,12 @@ from studiolink.lmstudio_adapter import LMStudioError
 from studiolink.models import (
     ImportMode,
     ImportResult,
-    is_synced,
     LinkMode,
     ModelReadiness,
     OllamaModel,
     SyncRecord,
     SyncResult,
+    is_synced,
 )
 from studiolink.ports import LMStudioPort
 from studiolink.state import StateStore
@@ -30,7 +30,10 @@ def same_file(left: Path, right: Path) -> bool:
         left_stat, right_stat = left.stat(), right.stat()
     except OSError:
         return False
-    return (left_stat.st_dev, left_stat.st_ino) == (right_stat.st_dev, right_stat.st_ino)
+    return (left_stat.st_dev, left_stat.st_ino) == (
+        right_stat.st_dev,
+        right_stat.st_ino,
+    )
 
 
 class Syncer:
@@ -84,7 +87,14 @@ class Syncer:
             model.readiness,
         )
         existing = records.get(model.canonical_name)
-        if is_synced(model, existing):
+        expected_target = None
+        if existing is not None and existing.imported_model_path is None:
+            expected_target = (
+                self.config.lmstudio_models_dir
+                / existing.user_repo
+                / existing.import_alias_path.name
+            )
+        if is_synced(model, existing, expected_target=expected_target):
             logger.debug("Model %s is already synced, skipping", model.canonical_name)
             return SyncResult(
                 model=model,
@@ -120,7 +130,7 @@ class Syncer:
             logger.debug("Using Ollama blob directly: %s", alias_path)
         else:
             try:
-                alias_path, alias_created = self._ensure_import_alias(model)
+                alias_path, alias_created = self._ensure_import_alias(model, link_mode)
                 logger.debug(
                     "Importing model via LM Studio: %s (mode=%s, dry_run=%s)",
                     alias_path,
@@ -136,6 +146,7 @@ class Syncer:
                 )
 
         import_error: Exception | None = None
+        import_result: ImportResult | None = None
         try:
             import_result = self.lmstudio.import_model(
                 str(alias_path),
@@ -149,17 +160,30 @@ class Syncer:
             logger.debug("LM Studio import failed: %s", exc)
             import_error = exc
         finally:
+            should_remove_alias = dry_run or link_mode is LinkMode.COPY
             if (
-                dry_run
-                and alias_created
+                should_remove_alias
+                and (alias_created or link_mode is LinkMode.COPY)
                 and alias_path.exists()
                 and import_mode is not ImportMode.DIRECT
             ):
-                logger.debug("Cleaning up dry-run alias: %s", alias_path)
-                alias_path.unlink()
+                logger.debug("Cleaning up temporary import alias: %s", alias_path)
+                try:
+                    alias_path.unlink()
+                    alias_path.parent.rmdir()
+                except OSError as exc:
+                    logger.warning(
+                        "Could not clean up import alias %s: %s", alias_path, exc
+                    )
 
         if import_error is not None:
             return SyncResult(model=model, status="error", message=str(import_error))
+        if import_result is None:
+            return SyncResult(
+                model=model,
+                status="error",
+                message="LM Studio import returned no result",
+            )
 
         record = SyncRecord(
             canonical_name=model.canonical_name,
@@ -169,6 +193,9 @@ class Syncer:
             user_repo=model.user_repo,
             link_mode=link_mode,
             imported_at=datetime.now(tz=timezone.utc),
+            imported_model_path=(
+                self.config.lmstudio_models_dir / model.user_repo / alias_path.name
+            ),
             import_command=import_result.command,
         )
         return SyncResult(
@@ -178,13 +205,19 @@ class Syncer:
             record=record,
         )
 
-    def _ensure_import_alias(self, model: OllamaModel) -> tuple[Path, bool]:
-        return _ensure_import_alias(model, self.config.import_staging_dir)
+    def _ensure_import_alias(
+        self, model: OllamaModel, link_mode: LinkMode
+    ) -> tuple[Path, bool]:
+        staging_dir = self.config.import_staging_dir
+        if link_mode is LinkMode.COPY:
+            # The alias controls the human-readable LM Studio filename. Keep
+            # this temporary hard link on the Ollama filesystem so copy mode
+            # still works when StudioLink state lives on another volume.
+            staging_dir = self.config.ollama_models_dir / ".studiolink-imports"
+        return _ensure_import_alias(model, staging_dir)
 
 
-def _ensure_import_alias(
-    model: OllamaModel, staging_dir: Path
-) -> tuple[Path, bool]:
+def _ensure_import_alias(model: OllamaModel, staging_dir: Path) -> tuple[Path, bool]:
     alias_path = staging_dir / model.import_filename
     if model.blob_path is None:
         raise RuntimeError(f"No blob path for model {model.canonical_name}")
@@ -202,9 +235,7 @@ def _ensure_import_alias(
         logger.debug("Created hard link: %s -> %s", alias_path, model.blob_path)
         return alias_path, True
     except OSError as exc:
-        raise RuntimeError(
-            f"Failed to create import alias (hard link): {exc}"
-        ) from exc
+        raise RuntimeError(f"Failed to create import alias (hard link): {exc}") from exc
 
 
 def _format_import_message(result: ImportResult) -> str:

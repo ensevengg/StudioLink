@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from conftest import (
     DIGEST_A,
     blob_filename,
@@ -76,6 +78,29 @@ class TestReadinessProblems:
 
 
 class TestMalformedManifests:
+    def test_io_failure_is_isolated_and_marks_scan_incomplete(
+        self, make_config, monkeypatch
+    ):
+        config = make_config()
+        broken = write_manifest(config, repository="broken", digest=DIGEST_A)
+        write_manifest(config, repository="healthy", digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        real_read_text = Path.read_text
+
+        def flaky_read_text(path, *args, **kwargs):
+            if path == broken:
+                raise OSError("access denied")
+            return real_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+        report = OllamaAdapter(config).scan_report()
+
+        assert report.source_available is True
+        assert report.complete is False
+        assert [model.repository for model in report.models] == ["healthy"]
+        assert any("access denied" in error for error in report.errors)
+
     def test_non_dict_json_is_invalid_not_crash(self, make_config):
         # Regression: a stray JSON array under manifests/ used to raise
         # AttributeError and kill the whole scan.
@@ -91,6 +116,25 @@ class TestMalformedManifests:
         model = scan_one(config)
         assert model.readiness is ModelReadiness.INVALID
         assert any("invalid manifest JSON" in issue for issue in model.issues)
+
+    def test_non_list_layers_is_invalid_not_crash(self, make_config):
+        config = make_config()
+        write_manifest(config, content={"layers": None})
+
+        model = scan_one(config)
+
+        assert model.readiness is ModelReadiness.INVALID
+        assert "manifest layers must be a list" in model.issues
+
+    def test_invalid_digest_is_rejected_before_path_resolution(self, make_config):
+        config = make_config()
+        write_manifest(config, digest="../../outside")
+
+        model = scan_one(config)
+
+        assert model.readiness is ModelReadiness.INVALID
+        assert model.blob_path is None
+        assert "model layer has an invalid SHA-256 digest" in model.issues
 
     def test_layer_without_digest(self, make_config):
         config = make_config()

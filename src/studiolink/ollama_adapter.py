@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from studiolink.config import StudioLinkConfig
-from studiolink.models import OllamaModel
-
+from studiolink.models import OllamaModel, OllamaScanReport
 
 MODEL_MEDIA_TYPE = "application/vnd.ollama.image.model"
 GGUF_MAGIC = b"GGUF"
+SHA256_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
 
 logger = logging.getLogger("studiolink")
 
@@ -19,19 +20,44 @@ class OllamaAdapter:
         self.config = config
 
     def scan_models(self) -> list[OllamaModel]:
+        return list(self.scan_report().models)
+
+    def scan_report(self) -> OllamaScanReport:
         manifests_dir = self.config.ollama_manifests_dir
         logger.debug("Scanning manifests directory: %s", manifests_dir)
-        if not manifests_dir.exists():
-            logger.warning("Manifests directory does not exist: %s", manifests_dir)
-            return []
+        if not manifests_dir.is_dir():
+            message = f"Manifests directory does not exist: {manifests_dir}"
+            logger.warning(message)
+            return OllamaScanReport(
+                source_available=False,
+                complete=False,
+                errors=(message,),
+            )
 
         models: list[OllamaModel] = []
-        manifest_files = sorted(
-            path for path in manifests_dir.rglob("*") if path.is_file()
-        )
+        errors: list[str] = []
+        try:
+            manifest_files = sorted(
+                path for path in manifests_dir.rglob("*") if path.is_file()
+            )
+        except OSError as exc:
+            message = f"Could not enumerate Ollama manifests: {exc}"
+            logger.warning(message)
+            return OllamaScanReport(
+                source_available=False,
+                complete=False,
+                errors=(message,),
+            )
+
         logger.debug("Found %d manifest file(s)", len(manifest_files))
         for manifest_path in manifest_files:
-            model = self._parse_manifest(manifest_path)
+            try:
+                model = self._parse_manifest(manifest_path)
+            except (OSError, UnicodeError) as exc:
+                message = f"Could not inspect manifest {manifest_path}: {exc}"
+                logger.warning(message)
+                errors.append(message)
+                continue
             if model is not None:
                 models.append(model)
                 logger.debug(
@@ -41,7 +67,12 @@ class OllamaAdapter:
                 )
             else:
                 logger.debug("Skipped manifest: %s", manifest_path)
-        return models
+        return OllamaScanReport(
+            models=tuple(models),
+            source_available=True,
+            complete=not errors,
+            errors=tuple(errors),
+        )
 
     def _parse_manifest(self, manifest_path: Path) -> OllamaModel | None:
         logger.debug("Parsing manifest: %s", manifest_path)
@@ -83,8 +114,13 @@ class OllamaAdapter:
             issues.append("manifest is not a JSON object")
             manifest = {}
 
+        layers = manifest.get("layers", [])
+        if not isinstance(layers, list):
+            issues.append("manifest layers must be a list")
+            layers = []
+
         model_layer = None
-        for layer in manifest.get("layers", []):
+        for layer in layers:
             if isinstance(layer, dict) and layer.get("mediaType") == MODEL_MEDIA_TYPE:
                 model_layer = layer
                 break
@@ -102,6 +138,8 @@ class OllamaAdapter:
             declared_size = self._as_int(model_layer.get("size"))
             if model_digest is None:
                 issues.append("model layer is missing a digest")
+            elif SHA256_DIGEST_PATTERN.fullmatch(model_digest) is None:
+                issues.append("model layer has an invalid SHA-256 digest")
             else:
                 blob_path = self.config.ollama_blobs_dir / model_digest.replace(
                     ":", "-"
@@ -140,8 +178,10 @@ class OllamaAdapter:
 
     @staticmethod
     def _as_int(value: object) -> int | None:
+        if not isinstance(value, (str, int, float)):
+            return None
         try:
-            return int(value) if value is not None else None
+            return int(value)
         except (TypeError, ValueError):
             return None
 

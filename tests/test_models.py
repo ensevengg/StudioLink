@@ -52,9 +52,7 @@ class TestUserRepo:
         assert make_ollama_model("llama3:1b").user_repo == "ollama/llama3"
 
     def test_namespaced_repository(self):
-        model = make_ollama_model(
-            "gemma:2b", namespace="marella", repository="gemma"
-        )
+        model = make_ollama_model("gemma:2b", namespace="marella", repository="gemma")
         assert model.user_repo == "ollama/marella-gemma"
 
     def test_custom_registry_dots_replaced(self):
@@ -136,9 +134,7 @@ class TestPruneTypes:
 
         report = PruneReport(
             dry_run=True,
-            aliases=(
-                PruneResult(Path("a"), 1, True, "r", False),
-            ),
+            aliases=(PruneResult(Path("a"), 1, True, "r", False),),
             records_removed=("old:model",),
         )
         payload = report.to_json()

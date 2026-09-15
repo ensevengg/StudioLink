@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -14,16 +15,40 @@ def _expand_path(env_name: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default.expanduser()
 
 
+def _default_ollama_models_dir(home: Path) -> Path:
+    if sys.platform.startswith("linux"):
+        return Path("/usr/share/ollama/.ollama/models")
+    return home / ".ollama" / "models"
+
+
 def _default_ollama_exe(home: Path) -> Path:
     if sys.platform == "win32":
-        return home / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
+        return Path(
+            shutil.which("ollama")
+            or home / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"
+        )
     return Path(shutil.which("ollama") or "/usr/bin/ollama")
 
 
 def _default_lms_exe(home: Path) -> Path:
     if sys.platform == "win32":
-        return home / ".lmstudio" / "bin" / "lms.exe"
+        return Path(shutil.which("lms") or home / ".lmstudio" / "bin" / "lms.exe")
     return Path(shutil.which("lms") or home / ".lmstudio" / "bin" / "lms")
+
+
+def _default_lmstudio_models_dir(home: Path) -> Path:
+    fallback = home / ".lmstudio" / "models"
+    settings_path = home / ".lmstudio" / "settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(payload, dict):
+        return fallback
+    downloads_folder = payload.get("downloadsFolder")
+    if not isinstance(downloads_folder, str) or not downloads_folder.strip():
+        return fallback
+    return Path(downloads_folder).expanduser()
 
 
 @dataclass(slots=True, frozen=True)
@@ -46,7 +71,7 @@ class StudioLinkConfig:
         # StudioLink-specific override is set.
         ollama_models_dir = _expand_path(
             "STUDIOLINK_OLLAMA_MODELS_DIR",
-            _expand_path("OLLAMA_MODELS", home / ".ollama" / "models"),
+            _expand_path("OLLAMA_MODELS", _default_ollama_models_dir(home)),
         )
         state_dir = _expand_path("STUDIOLINK_STATE_DIR", home / ".studiolink")
         return cls(
@@ -63,7 +88,7 @@ class StudioLinkConfig:
             ollama_blobs_dir=ollama_models_dir / "blobs",
             lmstudio_models_dir=_expand_path(
                 "STUDIOLINK_LMSTUDIO_MODELS_DIR",
-                home / ".lmstudio" / "models",
+                _default_lmstudio_models_dir(home),
             ),
             state_dir=state_dir,
             state_file=state_dir / "state.json",

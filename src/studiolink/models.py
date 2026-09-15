@@ -91,6 +91,14 @@ class OllamaModel:
 
 
 @dataclass(slots=True, frozen=True)
+class OllamaScanReport:
+    models: tuple[OllamaModel, ...] = ()
+    source_available: bool = True
+    complete: bool = True
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
 class SyncRecord:
     canonical_name: str
     digest: str
@@ -99,6 +107,7 @@ class SyncRecord:
     user_repo: str
     link_mode: LinkMode
     imported_at: datetime
+    imported_model_path: Path | None = None
     import_command: tuple[str, ...] = field(default_factory=tuple)
 
     def to_json(self) -> dict[str, object]:
@@ -110,11 +119,19 @@ class SyncRecord:
             "user_repo": self.user_repo,
             "link_mode": self.link_mode.value,
             "imported_at": self.imported_at.isoformat(),
+            "imported_model_path": (
+                None
+                if self.imported_model_path is None
+                else str(self.imported_model_path)
+            ),
             "import_command": list(self.import_command),
         }
 
     @classmethod
     def from_json(cls, payload: dict[str, object]) -> "SyncRecord":
+        import_command = payload.get("import_command", [])
+        if not isinstance(import_command, list):
+            raise TypeError("import_command must be a list")
         return cls(
             canonical_name=str(payload["canonical_name"]),
             digest=str(payload["digest"]),
@@ -123,17 +140,26 @@ class SyncRecord:
             user_repo=str(payload["user_repo"]),
             link_mode=LinkMode(str(payload["link_mode"])),
             imported_at=datetime.fromisoformat(str(payload["imported_at"])),
-            import_command=tuple(
-                str(item) for item in payload.get("import_command", [])
+            imported_model_path=(
+                Path(str(payload["imported_model_path"]))
+                if payload.get("imported_model_path")
+                else None
             ),
+            import_command=tuple(str(item) for item in import_command),
         )
 
 
-def is_synced(model: OllamaModel, record: SyncRecord | None) -> bool:
-    """Check if the sync record matches current model state."""
-    if record is None:
+def is_synced(
+    model: OllamaModel,
+    record: SyncRecord | None,
+    *,
+    expected_target: Path | None = None,
+) -> bool:
+    """Check if state and the imported LM Studio file match the model."""
+    if record is None or record.digest != model.model_digest:
         return False
-    return record.digest == model.model_digest
+    target = record.imported_model_path or expected_target
+    return target.is_file() if target is not None else True
 
 
 @dataclass(slots=True, frozen=True)

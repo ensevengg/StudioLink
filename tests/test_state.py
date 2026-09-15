@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 from conftest import DIGEST_A, make_sync_record
 
 from studiolink.models import SyncRecord
@@ -10,9 +9,7 @@ from studiolink.state import StateStore
 
 def write_raw_state(path, payload, *, raw=None):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        raw if raw is not None else json.dumps(payload), encoding="utf-8"
-    )
+    path.write_text(raw if raw is not None else json.dumps(payload), encoding="utf-8")
 
 
 class TestRoundtrip:
@@ -65,7 +62,9 @@ class TestCorruptionTolerance:
         good = make_sync_record("good:1", DIGEST_A).to_json()
         bad = make_sync_record("bad:1", DIGEST_A).to_json()
         bad["link_mode"] = "nonsense-mode"
-        write_raw_state(path, {"schema_version": 1, "sync_records": {"bad:1": bad, "good:1": good}})
+        write_raw_state(
+            path, {"schema_version": 1, "sync_records": {"bad:1": bad, "good:1": good}}
+        )
 
         store = StateStore(path)
         records = store.get_all_records()
@@ -75,7 +74,9 @@ class TestCorruptionTolerance:
     def test_non_dict_record_is_skipped(self, tmp_path):
         path = tmp_path / "state.json"
         good = make_sync_record("good:1", DIGEST_A).to_json()
-        write_raw_state(path, {"schema_version": 1, "sync_records": {"bad:1": 42, "good:1": good}})
+        write_raw_state(
+            path, {"schema_version": 1, "sync_records": {"bad:1": 42, "good:1": good}}
+        )
         assert set(StateStore(path).get_all_records()) == {"good:1"}
 
     def test_missing_sync_records_key(self, tmp_path):

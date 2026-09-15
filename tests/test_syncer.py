@@ -1,3 +1,4 @@
+import errno
 import os
 
 from conftest import (
@@ -11,7 +12,11 @@ from conftest import (
 from studiolink.models import ImportMode, ImportResult, LinkMode, ModelReadiness
 from studiolink.ollama_adapter import OllamaAdapter
 from studiolink.state import StateStore
-from studiolink.syncer import Syncer, _ensure_import_alias, _format_import_message, same_file
+from studiolink.syncer import (
+    _ensure_import_alias,
+    _format_import_message,
+    same_file,
+)
 
 
 def scan_models(config):
@@ -46,6 +51,9 @@ class TestHappyPath:
         record = StateStore(config.state_file).get_record("llama3:1b")
         assert record is not None and record.digest == DIGEST_A
         assert record.import_alias_path == alias
+        assert record.imported_model_path == (
+            config.lmstudio_models_dir / model.user_repo / model.import_filename
+        )
 
     def test_second_sync_skips(self, make_syncer):
         syncer, config, fake = make_syncer()
@@ -70,6 +78,46 @@ class TestHappyPath:
         assert results[0].status == "synced"
         assert fake.calls[0]["source_path"] == str(model.blob_path)
         assert not config.import_staging_dir.exists()
+
+
+class TestCrossVolumeCopy:
+    def test_copy_stages_on_ollama_volume_not_state_volume(
+        self, make_syncer, monkeypatch
+    ):
+        syncer, config, _ = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        model = scan_models(config)[0]
+        real_link = os.link
+
+        def cross_volume_link(source, target, *args, **kwargs):
+            if config.import_staging_dir in target.parents:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_link(source, target, *args, **kwargs)
+
+        monkeypatch.setattr("studiolink.syncer.os.link", cross_volume_link)
+
+        results = syncer.sync([model], **sync_kwargs(link_mode=LinkMode.COPY))
+
+        assert results[0].status == "synced"
+        assert results[0].record is not None
+        assert results[0].record.imported_model_path.is_file()
+        assert not (config.import_staging_dir / model.import_filename).exists()
+
+    def test_copy_removes_reused_temporary_alias(self, make_syncer):
+        syncer, config, _ = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        blob = write_blob(config, DIGEST_A)
+        model = scan_models(config)[0]
+        staging = config.ollama_models_dir / ".studiolink-imports"
+        staging.mkdir(parents=True)
+        alias = staging / model.import_filename
+        os.link(blob, alias)
+
+        results = syncer.sync([model], **sync_kwargs(link_mode=LinkMode.COPY))
+
+        assert results[0].status == "synced"
+        assert not alias.exists()
 
 
 class TestUnreadyModels:
@@ -151,9 +199,7 @@ class TestFailureIsolation:
         write_manifest(config, digest=DIGEST_A)
         write_blob(config, DIGEST_A)
         model = scan_models(config)[0]
-        fake.timeout_for = {
-            str(config.import_staging_dir / model.import_filename)
-        }
+        fake.timeout_for = {str(config.import_staging_dir / model.import_filename)}
 
         results = syncer.sync([model], **sync_kwargs())
 
@@ -264,9 +310,7 @@ class TestStateDurability:
             str(config.import_staging_dir / models["llama3:1b"].import_filename)
         }
 
-        syncer.sync(
-            [models["llama3:1b"], models["mistral:7b"]], **sync_kwargs()
-        )
+        syncer.sync([models["llama3:1b"], models["mistral:7b"]], **sync_kwargs())
 
         # Even though the batch "failed" on model 1, model 2's record persisted
         # after its own import.

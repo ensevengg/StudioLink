@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any
 
 from studiolink.config import StudioLinkConfig
 from studiolink.models import ImportResult, LinkMode
@@ -38,9 +37,7 @@ class LMStudioAdapter:
                 exc.returncode,
                 exc.stderr,
             ) from exc
-        output = "\n".join(
-            part for part in (result.stdout, result.stderr) if part
-        )
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part)
         return output.strip() or None
 
     def get_import_capabilities(self) -> set[LinkMode]:
@@ -119,6 +116,13 @@ class LMStudioAdapter:
         except subprocess.TimeoutExpired as exc:
             raise LMStudioError(
                 f"LM Studio command timed out after {timeout}s: {' '.join(command)}",
+                command,
+                -1,
+                str(exc),
+            ) from exc
+        except OSError as exc:
+            raise LMStudioError(
+                f"Could not execute LM Studio CLI: {exc}",
                 command,
                 -1,
                 str(exc),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from studiolink.models import SyncRecord
@@ -59,12 +60,10 @@ class StateStore:
             logger.warning("Skipping corrupt sync record %r: %s", name, exc)
             return None
 
-    def _save_raw(self, records: dict[str, object]) -> None:
+    def _save_raw(self, records: Mapping[str, object]) -> None:
         """Persist raw JSON dict to disk atomically."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            {"schema_version": 1, "sync_records": records}, indent=2
-        )
+        payload = json.dumps({"schema_version": 1, "sync_records": records}, indent=2)
         tmp_path = self.path.parent / (self.path.name + ".tmp")
         tmp_path.write_text(payload, encoding="utf-8")
         os.replace(tmp_path, self.path)
@@ -82,8 +81,7 @@ class StateStore:
             return {}
         if not isinstance(payload, dict):
             logger.warning(
-                "Corrupted state file at %s: expected a JSON object. "
-                "Starting fresh.",
+                "Corrupted state file at %s: expected a JSON object. Starting fresh.",
                 self.path,
             )
             return {}

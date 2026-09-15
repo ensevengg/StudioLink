@@ -48,7 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"StudioLink {__version__}",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, metavar="<command>"
+    )
 
     scan_parser = subparsers.add_parser(
         "scan",
@@ -334,8 +336,8 @@ Available Commands:
                     Usage: sdl scan [--json] [-v]
 
   sync              Import one or more models into LM Studio.
-                    Usage: sdl sync <model> [<model>...] [--copy|--hard-link|--symbolic-link] [--dry-run] [-v]
-                           sdl sync --all [--copy|--hard-link|--symbolic-link] [--dry-run] [-v]
+                    Usage: sdl sync <model> [<model>...] [--copy|--hard-link|--symbolic-link] [--direct] [--dry-run] [--json] [-v]
+                           sdl sync --all [--copy|--hard-link|--symbolic-link] [--direct] [--dry-run] [--json] [-v]
 
   status            Show discovered models and sync state.
                     Usage: sdl status [--json] [-v]
@@ -343,8 +345,8 @@ Available Commands:
   doctor            Check local StudioLink prerequisites.
                     Usage: sdl doctor [--json] [-v]
 
-  prune             Remove staging aliases and sync state for models that
-                    Ollama no longer has (reclaims pinned blob space).
+  prune             Safely remove unneeded staging aliases and stale state
+                    after a complete Ollama library scan.
                     Usage: sdl prune [--dry-run] [--json] [-v]
 
   upgrade           Check for and install a newer StudioLink version.
