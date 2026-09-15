@@ -3,14 +3,17 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from studiolink.config import StudioLinkConfig
 from studiolink.lmstudio_adapter import LMStudioAdapter
 from studiolink.models import (
+    ArtifactRole,
     DoctorCheck,
     ImportMode,
     LinkMode,
+    LMStudioModel,
     ModelReadiness,
     OllamaModel,
     OllamaScanReport,
@@ -74,10 +77,23 @@ class StudioLinkService:
     def status(self) -> list[StatusEntry]:
         models = self.scan()
         records = self.state.get_all_records()
+        needs_inventory = any(
+            model.readiness is ModelReadiness.READY
+            and any(
+                artifact.role is ArtifactRole.PROJECTOR for artifact in model.artifacts
+            )
+            and records.get(model.canonical_name) is not None
+            for model in models
+        )
+        inventory = self.lmstudio.list_models() if needs_inventory else None
         return [
             StatusEntry(
                 model=model,
-                synced=self._record_is_synced(model, records.get(model.canonical_name)),
+                synced=self._record_is_synced(
+                    model,
+                    records.get(model.canonical_name),
+                    inventory=inventory,
+                ),
                 sync_record=records.get(model.canonical_name),
             )
             for model in models
@@ -130,11 +146,20 @@ class StudioLinkService:
             raise RuntimeError(f"Ollama manifest scan was incomplete: {details}")
 
         models = list(scan.models)
-        expected: dict[str, OllamaModel] = {
-            model.import_filename: model
-            for model in models
-            if model.readiness is ModelReadiness.READY and model.blob_path is not None
-        }
+        expected: dict[str, Path] = {}
+        for model in models:
+            if model.readiness is not ModelReadiness.READY:
+                continue
+            if model.artifacts:
+                expected.update(
+                    {
+                        model.artifact_import_filename(artifact): artifact.blob_path
+                        for artifact in model.artifacts
+                        if artifact.blob_path is not None
+                    }
+                )
+            elif model.blob_path is not None:
+                expected[model.import_filename] = model.blob_path
         records = self.state.get_all_records()
         unready_names = {
             model.canonical_name
@@ -142,9 +167,10 @@ class StudioLinkService:
             if model.readiness is not ModelReadiness.READY
         }
         protected_aliases = {
-            record.import_alias_path
+            artifact.import_alias_path
             for name, record in records.items()
             if record.link_mode is LinkMode.SYMBOLIC_LINK or name in unready_names
+            for artifact in record.artifacts
         }
 
         alias_results: list[PruneResult] = []
@@ -156,12 +182,12 @@ class StudioLinkService:
                 if path in protected_aliases:
                     logger.debug("Preserving required import alias: %s", path)
                     continue
-                model = expected.get(path.name)
-                if model is not None and same_file(path, model.blob_path or path):
+                expected_blob = expected.get(path.name)
+                if expected_blob is not None and same_file(path, expected_blob):
                     continue
                 reason = (
                     "alias no longer points at the current model blob"
-                    if model is not None
+                    if expected_blob is not None
                     else "model no longer present in Ollama (or was re-pulled)"
                 )
                 try:
@@ -347,7 +373,13 @@ class StudioLinkService:
         )
         return DoctorCheck("hard-link volume compatibility", ok, details)
 
-    def _record_is_synced(self, model: OllamaModel, record: SyncRecord | None) -> bool:
+    def _record_is_synced(
+        self,
+        model: OllamaModel,
+        record: SyncRecord | None,
+        *,
+        inventory: tuple[LMStudioModel, ...] | None = None,
+    ) -> bool:
         expected_target = None
         if record is not None and record.imported_model_path is None:
             expected_target = (
@@ -355,7 +387,28 @@ class StudioLinkService:
                 / record.user_repo
                 / record.import_alias_path.name
             )
-        return is_synced(model, record, expected_target=expected_target)
+        if not is_synced(model, record, expected_target=expected_target):
+            return False
+        if not any(
+            artifact.role is ArtifactRole.PROJECTOR for artifact in model.artifacts
+        ):
+            return True
+        if record is None or inventory is None:
+            return False
+        primary_target = record.imported_model_path or expected_target
+        if primary_target is None:
+            return False
+        try:
+            relative_target = primary_target.relative_to(
+                self.config.lmstudio_models_dir
+            ).as_posix()
+        except ValueError:
+            return False
+        return any(
+            item.path.replace("\\", "/").casefold() == relative_target.casefold()
+            and item.vision
+            for item in inventory
+        )
 
     def _select_models(
         self, discovered: list[OllamaModel], requested_names: list[str]

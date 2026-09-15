@@ -65,6 +65,46 @@ class TestUserRepo:
         assert model.user_repo == "ollama/ghcr-io-team-gemma"
 
 
+class TestImportRepository:
+    def test_projector_bundles_use_digest_isolated_repository(self):
+        from dataclasses import replace
+        from pathlib import Path
+
+        from studiolink.models import ArtifactRole, OllamaArtifact
+
+        model = make_ollama_model("llava:latest", DIGEST_A)
+        projector = OllamaArtifact(
+            role=ArtifactRole.PROJECTOR,
+            media_type="application/vnd.ollama.image.projector",
+            digest=DIGEST_B,
+            blob_path=Path("projector"),
+            declared_size=1,
+            blob_size=1,
+            gguf_valid=True,
+            manifest_index=1,
+        )
+        primary = OllamaArtifact(
+            role=ArtifactRole.MODEL,
+            media_type="application/vnd.ollama.image.model",
+            digest=DIGEST_A,
+            blob_path=Path("model"),
+            declared_size=1,
+            blob_size=1,
+            gguf_valid=True,
+            manifest_index=0,
+        )
+        model = replace(model, artifacts=(primary, projector))
+
+        assert model.import_user_repo == (
+            "ollama/llava--bundle-aaaaaaaaaaaa-bbbbbbbbbbbb"
+        )
+        changed = replace(
+            model,
+            artifacts=(primary, replace(projector, digest="sha256:" + "c" * 64)),
+        )
+        assert changed.import_user_repo != model.import_user_repo
+
+
 class TestReadiness:
     def test_ready(self):
         assert make_ollama_model("m:1").readiness is ModelReadiness.READY
@@ -108,6 +148,31 @@ class TestSyncRecordRoundtrip:
     def test_import_command_defaults_empty(self):
         restored = make_sync_record().to_json()
         assert restored["import_command"] == []
+
+    def test_projector_artifact_roundtrip(self):
+        from dataclasses import replace
+        from pathlib import Path
+
+        from studiolink.models import ArtifactRole, SyncedArtifact
+
+        record = make_sync_record()
+        projector = SyncedArtifact(
+            role=ArtifactRole.PROJECTOR,
+            digest=DIGEST_B,
+            blob_path=Path("projector-blob"),
+            import_alias_path=Path("mmproj-model.gguf"),
+            imported_model_path=Path("models/ollama/model/mmproj-model.gguf"),
+            import_command=("lms", "import"),
+        )
+        record = replace(
+            record,
+            artifacts=(*record.artifacts, projector),
+            vision_confirmed=True,
+        )
+
+        restored = type(record).from_json(record.to_json())
+
+        assert restored == record
 
 
 class TestPruneTypes:

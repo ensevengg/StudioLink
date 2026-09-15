@@ -17,9 +17,12 @@ if str(_SRC) not in sys.path:
 from studiolink.config import StudioLinkConfig  # noqa: E402
 from studiolink.lmstudio_adapter import LMStudioError  # noqa: E402
 from studiolink.models import (  # noqa: E402
+    ArtifactRole,
     ImportResult,
     LinkMode,
+    LMStudioModel,
     OllamaModel,
+    SyncedArtifact,
     SyncRecord,
 )
 
@@ -141,12 +144,17 @@ def make_sync_record(
 ) -> SyncRecord:
     return SyncRecord(
         canonical_name=canonical_name,
-        digest=digest,
-        blob_path=Path("blob"),
-        import_alias_path=Path("alias"),
         user_repo="ollama/llama3",
         link_mode=LinkMode.HARD_LINK,
         imported_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        artifacts=(
+            SyncedArtifact(
+                role=ArtifactRole.MODEL,
+                digest=digest,
+                blob_path=Path("blob"),
+                import_alias_path=Path("alias"),
+            ),
+        ),
     )
 
 
@@ -158,12 +166,33 @@ class FakeLMStudio:
         self.fail_for: set[str] = set()
         self.timeout_for: set[str] = set()
         self.models_dir: Path | None = None
+        self.inventory_override: tuple[LMStudioModel, ...] | None = None
 
     def get_version(self) -> str | None:
         return "0.3.17 (fake)"
 
     def get_import_capabilities(self) -> set[LinkMode]:
         return {LinkMode.HARD_LINK, LinkMode.COPY, LinkMode.SYMBOLIC_LINK}
+
+    def list_models(self) -> tuple[LMStudioModel, ...]:
+        if self.inventory_override is not None:
+            return self.inventory_override
+        if self.models_dir is None or not self.models_dir.exists():
+            return ()
+        inventory = []
+        for path in self.models_dir.rglob("*.gguf"):
+            if path.name.startswith("mmproj-"):
+                continue
+            relative = path.relative_to(self.models_dir)
+            inventory.append(
+                LMStudioModel(
+                    model_key=path.stem,
+                    path=relative.as_posix(),
+                    vision=any(path.parent.glob("mmproj-*.gguf")),
+                    model_type="llm",
+                )
+            )
+        return tuple(inventory)
 
     def import_model(
         self,

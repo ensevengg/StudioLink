@@ -24,6 +24,13 @@ def build_service(config, lmstudio):
     )
 
 
+def replace_primary(record, **changes):
+    return replace(
+        record,
+        artifacts=(replace(record.primary_artifact, **changes),),
+    )
+
+
 class TestDoctorVolumeCheck:
     def test_same_device_passes(self, make_config, fake_lmstudio):
         config = make_config()
@@ -157,7 +164,7 @@ class TestPrune:
         alias = config.import_staging_dir / model.import_filename
         os.link(blob, alias)
         StateStore(config.state_file).upsert(
-            replace(
+            replace_primary(
                 make_sync_record(model.canonical_name, DIGEST_A),
                 import_alias_path=alias,
             )
@@ -182,8 +189,10 @@ class TestPrune:
         alias = config.import_staging_dir / model.import_filename
         os.link(blob, alias)
         record = replace(
-            make_sync_record(model.canonical_name, DIGEST_A),
-            import_alias_path=alias,
+            replace_primary(
+                make_sync_record(model.canonical_name, DIGEST_A),
+                import_alias_path=alias,
+            ),
             link_mode=LinkMode.SYMBOLIC_LINK,
         )
         StateStore(config.state_file).upsert(record)
@@ -209,6 +218,44 @@ class TestPrune:
 
         assert report.aliases == ()
         assert (config.import_staging_dir / model.import_filename).exists()
+
+    def test_keeps_all_healthy_projector_bundle_aliases(
+        self, make_config, fake_lmstudio
+    ):
+        config = make_config()
+        fake_lmstudio.models_dir = config.lmstudio_models_dir
+        service = build_service(config, fake_lmstudio)
+        projector_digest = "sha256:" + "c" * 64
+        write_manifest(
+            config,
+            repository="llava",
+            content={
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.ollama.image.model",
+                        "digest": DIGEST_A,
+                    },
+                    {
+                        "mediaType": "application/vnd.ollama.image.projector",
+                        "digest": projector_digest,
+                    },
+                ]
+            },
+        )
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        model = service.scan()[0]
+        assert service.sync(model_names=[model.canonical_name])[0].status == "synced"
+
+        report = service.prune()
+
+        assert report.aliases == ()
+        assert all(
+            (
+                config.import_staging_dir / model.artifact_import_filename(artifact)
+            ).exists()
+            for artifact in model.artifacts
+        )
 
     def test_removes_same_name_alias_pointing_elsewhere(
         self, make_config, fake_lmstudio
@@ -341,7 +388,7 @@ class TestStatusAndSelection:
         target.parent.mkdir(parents=True)
         target.write_bytes(b"GGUFxxxx")
         StateStore(config.state_file).upsert(
-            replace(
+            replace_primary(
                 make_sync_record("llama3:1b", DIGEST_A),
                 imported_model_path=target,
             )
@@ -380,6 +427,39 @@ class TestStatusAndSelection:
         assert entries[0].display_status == "pending"
         assert entries[0].synced is False
 
+    def test_status_requires_projector_bundle_in_lm_studio_inventory(
+        self, make_config, fake_lmstudio
+    ):
+        config = make_config()
+        fake_lmstudio.models_dir = config.lmstudio_models_dir
+        service = build_service(config, fake_lmstudio)
+        projector_digest = "sha256:" + "c" * 64
+        write_manifest(
+            config,
+            repository="llava",
+            content={
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.ollama.image.model",
+                        "digest": DIGEST_A,
+                    },
+                    {
+                        "mediaType": "application/vnd.ollama.image.projector",
+                        "digest": projector_digest,
+                    },
+                ]
+            },
+        )
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        assert service.sync(model_names=["llava:1b"])[0].status == "synced"
+        fake_lmstudio.inventory_override = ()
+
+        entries = service.status()
+
+        assert entries[0].display_status == "pending"
+        assert entries[0].synced is False
+
     def test_status_reports_pending_when_imported_target_was_deleted(
         self, make_config, fake_lmstudio
     ):
@@ -389,7 +469,7 @@ class TestStatusAndSelection:
         write_blob(config, DIGEST_A)
         missing_target = config.lmstudio_models_dir / "ollama" / "llama3" / "gone.gguf"
         StateStore(config.state_file).upsert(
-            replace(
+            replace_primary(
                 make_sync_record("llama3:1b", DIGEST_A),
                 imported_model_path=missing_target,
             )

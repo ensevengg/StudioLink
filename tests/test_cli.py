@@ -186,6 +186,7 @@ class TestJsonOutput:
         payload = json.loads(out(capsys))
         assert payload[0]["canonical_name"] == "llama3:1b"
         assert payload[0]["readiness"] == "ready"
+        assert payload[0]["artifacts"] == []
 
     def test_status_json(self, fake_service, capsys):
         assert cli.main(["status", "--json"]) == 0

@@ -1,5 +1,7 @@
+import json
 from pathlib import Path
 
+import pytest
 from conftest import (
     DIGEST_A,
     blob_filename,
@@ -7,7 +9,7 @@ from conftest import (
     write_manifest,
 )
 
-from studiolink.models import ModelReadiness
+from studiolink.models import ArtifactRole, ModelReadiness
 from studiolink.ollama_adapter import OllamaAdapter
 
 
@@ -31,6 +33,28 @@ class TestScanHappyPath:
         assert model.blob_size == 12  # 4 header bytes + 8 padding
         assert model.declared_size == 1234
         assert model.issues == ()
+
+    def test_scans_model_and_projector_as_one_ready_model(self, make_config):
+        config = make_config()
+        fixture = (
+            Path(__file__).parent / "fixtures" / "ollama" / "llava-latest-manifest.json"
+        )
+        content = json.loads(fixture.read_text(encoding="utf-8"))
+        write_manifest(config, repository="llava", content=content)
+        for layer in content["layers"][:2]:
+            write_blob(config, layer["digest"])
+
+        model = scan_one(config)
+
+        assert model.canonical_name == "llava:1b"
+        assert model.readiness is ModelReadiness.READY
+        assert [artifact.role for artifact in model.artifacts] == [
+            ArtifactRole.MODEL,
+            ArtifactRole.PROJECTOR,
+        ]
+        assert model.artifact_import_filename(model.artifacts[1]).startswith(
+            "mmproj-llava-1b-"
+        )
 
     def test_declared_size_garbage_is_tolerated(self, make_config):
         config = make_config()
@@ -75,6 +99,85 @@ class TestReadinessProblems:
         model = scan_one(config)
         assert model.readiness is ModelReadiness.INVALID
         assert "missing Ollama model layer" in model.issues
+
+    def test_missing_projector_blob_makes_bundle_stale(self, make_config):
+        config = make_config()
+        write_manifest(
+            config,
+            content={
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.ollama.image.model",
+                        "digest": DIGEST_A,
+                    },
+                    {
+                        "mediaType": "application/vnd.ollama.image.projector",
+                        "digest": "sha256:" + "c" * 64,
+                    },
+                ]
+            },
+        )
+        write_blob(config, DIGEST_A)
+
+        model = scan_one(config)
+
+        assert model.readiness is ModelReadiness.STALE
+        assert "projector blob is missing from the Ollama blob store" in model.issues
+
+    @pytest.mark.parametrize(
+        ("extra_layers", "issue"),
+        [
+            (
+                [
+                    {
+                        "mediaType": "application/vnd.ollama.image.projector",
+                        "digest": "sha256:" + "c" * 64,
+                    },
+                    {
+                        "mediaType": "application/vnd.ollama.image.projector",
+                        "digest": "sha256:" + "d" * 64,
+                    },
+                ],
+                "multiple Ollama projector layers are not supported",
+            ),
+            (
+                [
+                    {
+                        "mediaType": "application/vnd.ollama.image.adapter",
+                        "digest": "sha256:" + "c" * 64,
+                    }
+                ],
+                "Ollama adapter layers are not supported",
+            ),
+            (
+                [
+                    {
+                        "mediaType": "application/vnd.ollama.image.draft",
+                        "digest": "sha256:" + "c" * 64,
+                    }
+                ],
+                "Ollama draft layers are not supported",
+            ),
+        ],
+    )
+    def test_unsupported_artifact_combinations_are_invalid(
+        self, make_config, extra_layers, issue
+    ):
+        config = make_config()
+        layers = [
+            {
+                "mediaType": "application/vnd.ollama.image.model",
+                "digest": DIGEST_A,
+            },
+            *extra_layers,
+        ]
+        write_manifest(config, content={"layers": layers})
+        write_blob(config, DIGEST_A)
+
+        model = scan_one(config)
+
+        assert model.readiness is ModelReadiness.INVALID
+        assert issue in model.issues
 
 
 class TestMalformedManifests:

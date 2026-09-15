@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from studiolink.models import ImportResult, LinkMode, OllamaModel, OllamaScanReport
+from studiolink.models import (
+    ImportResult,
+    LinkMode,
+    LMStudioModel,
+    OllamaModel,
+    OllamaScanReport,
+)
 
 
 @runtime_checkable
@@ -17,6 +23,8 @@ class LMStudioPort(Protocol):
     def get_version(self) -> str | None: ...
 
     def get_import_capabilities(self) -> set[LinkMode]: ...
+
+    def list_models(self) -> tuple[LMStudioModel, ...]: ...
 
     def import_model(
         self,

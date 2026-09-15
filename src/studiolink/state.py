@@ -63,7 +63,7 @@ class StateStore:
     def _save_raw(self, records: Mapping[str, object]) -> None:
         """Persist raw JSON dict to disk atomically."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"schema_version": 1, "sync_records": records}, indent=2)
+        payload = json.dumps({"schema_version": 2, "sync_records": records}, indent=2)
         tmp_path = self.path.parent / (self.path.name + ".tmp")
         tmp_path.write_text(payload, encoding="utf-8")
         os.replace(tmp_path, self.path)

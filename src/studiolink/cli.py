@@ -186,6 +186,13 @@ def run_scan(args: argparse.Namespace, service: StudioLinkService) -> int:
     for model in models:
         print(f"- {model.canonical_name} [{model.readiness.value}]")
         print(f"  blob: {model.blob_path or 'missing'}")
+        for artifact in model.artifacts:
+            if artifact.role.value != "model":
+                print(
+                    f"  {artifact.role.value}: "
+                    f"{artifact.blob_path or 'missing'} "
+                    f"[{artifact.readiness.value}]"
+                )
         if model.issues:
             print(f"  issues: {'; '.join(model.issues)}")
     return 0
@@ -403,6 +410,18 @@ def _model_to_json(model: object) -> dict[str, object]:
         "gguf_valid": getattr(model, "gguf_valid"),
         "issues": list(getattr(model, "issues")),
         "user_repo": getattr(model, "user_repo"),
+        "artifacts": [
+            {
+                "role": artifact.role.value,
+                "media_type": artifact.media_type,
+                "digest": artifact.digest,
+                "blob_path": (str(artifact.blob_path) if artifact.blob_path else None),
+                "readiness": artifact.readiness.value,
+                "gguf_valid": artifact.gguf_valid,
+                "issues": list(artifact.issues),
+            }
+            for artifact in getattr(model, "artifacts", ())
+        ],
     }
 
 
