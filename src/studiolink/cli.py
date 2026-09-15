@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import subprocess
 import sys
 import urllib.request
@@ -297,7 +298,9 @@ def run_upgrade(args: argparse.Namespace, service: StudioLinkService) -> int:
         "-m",
         "pip",
         "install",
-        "studiolink",
+        # Pin the version we just reported so the success message cannot
+        # describe a different release than the one pip actually installed.
+        f"studiolink=={latest}",
         "--upgrade",
         "--quiet",
     ]
@@ -329,8 +332,10 @@ def run_upgrade(args: argparse.Namespace, service: StudioLinkService) -> int:
 def _version_tuple(version: str) -> tuple[int, ...]:
     parts: list[int] = []
     for piece in version.split("."):
-        digits = "".join(ch for ch in piece if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
+        # Compare only the leading numeric run of each component so that
+        # pre-release suffixes like "1rc1" do not concatenate into 11.
+        match = re.match(r"\d+", piece)
+        parts.append(int(match.group()) if match else 0)
     return tuple(parts)
 
 

@@ -164,6 +164,8 @@ sdl doctor --json
 - Ollama manifests and blobs directories exist
 - LM Studio models directory exists
 - Hard-link filesystem/volume compatibility
+- Hard-link permission on blobs (a real link is created and removed again, catching restrictions such as Linux `fs.protected_hardlinks`)
+- LM Studio model inventory (`lms ls --json`; required to verify projector bundles)
 - Discovered Ollama models
 - Blob presence validation
 - GGUF header validation

@@ -1,9 +1,12 @@
 import errno
 import os
+import types
+from pathlib import Path
 
 from conftest import (
     DIGEST_A,
     DIGEST_B,
+    blob_filename,
     make_ollama_model,
     write_blob,
     write_manifest,
@@ -588,3 +591,214 @@ class TestReadinessOfSyncedModels:
         results = syncer.sync([model], **sync_kwargs())
         assert results[0].model is model
         assert results[0].model.readiness is ModelReadiness.READY
+
+
+class TestAliasFilesystemErrors:
+    def test_blocked_staging_dir_is_per_model_error(self, make_syncer):
+        # Regression: PermissionError/FileExistsError from mkdir() or the
+        # stale-alias unlink() escaped _sync_one and aborted the whole batch.
+        syncer, config, fake = make_syncer()
+        write_manifest(config, repository="m1", tag="1b", digest=DIGEST_A)
+        write_manifest(config, repository="m2", tag="1b", digest=DIGEST_B)
+        write_blob(config, DIGEST_A)
+        write_blob(config, DIGEST_B)
+        config.import_staging_dir.parent.mkdir(parents=True, exist_ok=True)
+        config.import_staging_dir.write_text("a file, not a directory")
+
+        results = syncer.sync(scan_models(config), **sync_kwargs())
+
+        assert [result.status for result in results] == ["error", "error"]
+        assert all("import alias" in result.message for result in results)
+        assert fake.calls == []
+
+    def test_stale_alias_unlink_failure_is_per_model_error(
+        self, make_syncer, monkeypatch
+    ):
+        syncer, config, fake = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        model = scan_models(config)[0]
+        config.import_staging_dir.mkdir(parents=True)
+        stale = config.import_staging_dir / model.import_filename
+        stale.write_bytes(b"stale content")
+
+        def denied(path, *args, **kwargs):
+            if path == stale:
+                raise PermissionError(1, "Operation not permitted")
+            return real_unlink(path, *args, **kwargs)
+
+        real_unlink = Path.unlink
+        monkeypatch.setattr(Path, "unlink", denied)
+
+        result = syncer.sync([model], **sync_kwargs())[0]
+
+        assert result.status == "error"
+        assert "stale import alias" in result.message
+
+    def test_zero_inode_files_never_compare_equal(self, tmp_path, monkeypatch):
+        # Filesystems without file ids (FAT/exFAT) report st_ino == 0 for
+        # every file; identity must be treated as unknowable rather than
+        # matching every file on the volume (stale-weight reuse risk).
+        left = tmp_path / "a.gguf"
+        right = tmp_path / "b.gguf"
+        left.write_bytes(b"GGUFsame-size")
+        right.write_bytes(b"GGUFsame-size")
+        real_stat = os.stat
+
+        def inodeless_stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            return types.SimpleNamespace(
+                st_dev=st.st_dev,
+                st_ino=0,
+                st_size=st.st_size,
+                st_mtime_ns=st.st_mtime_ns,
+            )
+
+        monkeypatch.setattr(Path, "stat", inodeless_stat)
+
+        assert same_file(left, right) is False
+        assert same_file(left, left) is False
+
+
+def write_bundle(config, model_digest, projector_digest, *, model_first):
+    layers = [
+        {"mediaType": "application/vnd.ollama.image.model", "digest": model_digest},
+        {
+            "mediaType": "application/vnd.ollama.image.projector",
+            "digest": projector_digest,
+        },
+    ]
+    if not model_first:
+        layers.reverse()
+    write_manifest(config, repository="llava", content={"layers": layers})
+
+
+class TestProjectorFirstManifests:
+    def test_projector_first_manifest_imports_model_first(self, make_syncer):
+        # Regression: a partial record persisted before the model artifact
+        # made primary_artifact raise StopIteration and abort the batch.
+        syncer, config, fake = make_syncer()
+        projector_digest = "sha256:" + "c" * 64
+        write_bundle(config, DIGEST_A, projector_digest, model_first=False)
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        model = scan_models(config)[0]
+
+        result = syncer.sync([model], **sync_kwargs())[0]
+
+        assert result.status == "synced"
+        assert [artifact["user_repo"] for artifact in fake.calls] == [
+            model.import_user_repo
+        ] * 2
+        assert fake.calls[0]["source_path"].endswith(model.import_filename)
+        record = StateStore(config.state_file).get_record(model.canonical_name)
+        assert record is not None
+        assert [artifact.role for artifact in record.artifacts] == [
+            ArtifactRole.MODEL,
+            ArtifactRole.PROJECTOR,
+        ]
+
+    def test_failed_model_import_in_projector_first_batch_continues(self, make_syncer):
+        syncer, config, fake = make_syncer()
+        projector_digest = "sha256:" + "c" * 64
+        write_bundle(config, DIGEST_A, projector_digest, model_first=False)
+        write_manifest(config, repository="mistral", tag="7b", digest=DIGEST_B)
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        write_blob(config, DIGEST_B)
+        models = {m.canonical_name: m for m in scan_models(config)}
+        fake.fail_for = {
+            str(config.import_staging_dir / models["llava:1b"].import_filename)
+        }
+
+        results = syncer.sync(
+            [models["llava:1b"], models["mistral:7b"]], **sync_kwargs()
+        )
+
+        assert results[0].status == "error"
+        assert results[0].record is None  # no projector-only partial persisted
+        assert results[1].status == "synced"
+        records = StateStore(config.state_file).get_all_records()
+        assert set(records) == {"mistral:7b"}
+
+
+class TestBundleCoLocation:
+    """A changed sibling digest changes import_user_repo; both artifacts must
+    end up in the new bundle directory or LM Studio cannot pair them."""
+
+    def test_changed_model_digest_reimports_whole_bundle(self, make_syncer):
+        syncer, config, fake = make_syncer()
+        projector_digest = "sha256:" + "c" * 64
+        write_bundle(config, DIGEST_A, projector_digest, model_first=True)
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        model = scan_models(config)[0]
+        assert syncer.sync([model], **sync_kwargs())[0].status == "synced"
+
+        write_blob(config, DIGEST_B)
+        write_bundle(config, DIGEST_B, projector_digest, model_first=True)
+        model = scan_models(config)[0]
+
+        result = syncer.sync([model], **sync_kwargs())[0]
+
+        assert result.status == "synced"
+        new_repo = model.import_user_repo
+        assert [call["user_repo"] for call in fake.calls[2:]] == [new_repo, new_repo]
+        record = StateStore(config.state_file).get_record("llava:1b")
+        assert record is not None
+        assert all(
+            artifact.imported_model_path is not None
+            and artifact.imported_model_path.parent
+            == config.lmstudio_models_dir / new_repo
+            for artifact in record.artifacts
+        )
+
+    def test_changed_projector_digest_reimports_whole_bundle(self, make_syncer):
+        # The dangerous direction: the unchanged model must move to the new
+        # bundle directory too, and vision must be confirmed against it.
+        syncer, config, fake = make_syncer()
+        projector_digest = "sha256:" + "c" * 64
+        write_bundle(config, DIGEST_A, projector_digest, model_first=True)
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        model = scan_models(config)[0]
+        assert syncer.sync([model], **sync_kwargs())[0].status == "synced"
+
+        new_projector = "sha256:" + "d" * 64
+        write_blob(config, new_projector)
+        write_bundle(config, DIGEST_A, new_projector, model_first=True)
+        model = scan_models(config)[0]
+
+        result = syncer.sync([model], **sync_kwargs())[0]
+
+        assert result.status == "synced"
+        new_repo = model.import_user_repo
+        assert [call["user_repo"] for call in fake.calls[2:]] == [new_repo, new_repo]
+        assert fake.calls[3]["source_path"].endswith(
+            model.artifact_import_filename(model.artifacts[1])
+        )
+        record = StateStore(config.state_file).get_record("llava:1b")
+        assert record is not None
+        assert all(
+            artifact.imported_model_path is not None
+            and artifact.imported_model_path.parent
+            == config.lmstudio_models_dir / new_repo
+            for artifact in record.artifacts
+        )
+
+    def test_synced_bundle_skips_when_blob_is_removed(self, make_syncer):
+        # An intact LM Studio import needs nothing from Ollama; "already
+        # synced" must win over the stale check for bundles too.
+        syncer, config, fake = make_syncer()
+        projector_digest = "sha256:" + "c" * 64
+        write_bundle(config, DIGEST_A, projector_digest, model_first=True)
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        model = scan_models(config)[0]
+        assert syncer.sync([model], **sync_kwargs())[0].status == "synced"
+        (config.ollama_blobs_dir / blob_filename(projector_digest)).unlink()
+
+        result = syncer.sync([model], **sync_kwargs())[0]
+
+        assert result.status == "skipped"
+        assert len(fake.calls) == 2

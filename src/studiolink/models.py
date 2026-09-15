@@ -210,10 +210,11 @@ class SyncRecord:
 
     @property
     def primary_artifact(self) -> SyncedArtifact:
-        return next(
-            artifact
-            for artifact in self.artifacts
-            if artifact.role is ArtifactRole.MODEL
+        for artifact in self.artifacts:
+            if artifact.role is ArtifactRole.MODEL:
+                return artifact
+        raise ValueError(
+            f"sync record for {self.canonical_name!r} has no model artifact"
         )
 
     # Compatibility properties for callers and schema-v1 JSON consumers.

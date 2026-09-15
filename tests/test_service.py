@@ -12,6 +12,7 @@ from conftest import (
 )
 
 import studiolink.service as service_module
+from studiolink.lmstudio_adapter import LMStudioError
 from studiolink.models import LinkMode
 from studiolink.ollama_adapter import OllamaAdapter
 from studiolink.service import StudioLinkService
@@ -501,3 +502,154 @@ class TestStatusAndSelection:
         selected = service._select_models(models, ["llama3"])
 
         assert {m.tag for m in selected} == {"1b", "70b"}
+
+
+class TestStatusInventoryDegradation:
+    def make_synced_vision_model(self, config, service):
+        projector_digest = "sha256:" + "c" * 64
+        write_manifest(
+            config,
+            repository="llava",
+            content={
+                "layers": [
+                    {
+                        "mediaType": "application/vnd.ollama.image.model",
+                        "digest": DIGEST_A,
+                    },
+                    {
+                        "mediaType": "application/vnd.ollama.image.projector",
+                        "digest": projector_digest,
+                    },
+                ]
+            },
+        )
+        write_blob(config, DIGEST_A)
+        write_blob(config, projector_digest)
+        model = OllamaAdapter(config).scan_models()[0]
+        result = service.sync(model_names=[model.canonical_name])[0]
+        assert result.status == "synced"
+        return model
+
+    def test_status_survives_lm_studio_inventory_failure(
+        self, make_config, fake_lmstudio, monkeypatch
+    ):
+        # Regression: a broken lms used to crash the whole status command for
+        # users with synced vision models.
+        config = make_config()
+        fake_lmstudio.models_dir = config.lmstudio_models_dir
+        service = build_service(config, fake_lmstudio)
+        self.make_synced_vision_model(config, service)
+
+        def broken_inventory():
+            raise LMStudioError("lms is broken", ["lms"], 1, "boom")
+
+        monkeypatch.setattr(fake_lmstudio, "list_models", broken_inventory)
+
+        entries = service.status()
+
+        entry = next(e for e in entries if e.model.canonical_name == "llava:1b")
+        assert entry.synced is False
+        assert entry.display_status == "pending"
+
+    def test_status_uses_inventory_when_available(self, make_config, fake_lmstudio):
+        config = make_config()
+        fake_lmstudio.models_dir = config.lmstudio_models_dir
+        service = build_service(config, fake_lmstudio)
+        self.make_synced_vision_model(config, service)
+
+        entries = service.status()
+
+        entry = next(e for e in entries if e.model.canonical_name == "llava:1b")
+        assert entry.synced is True
+
+
+class TestDoctorHardLinkPermission:
+    def test_probe_passes_on_linkable_filesystem(self, make_config, fake_lmstudio):
+        config = make_config()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        config.import_staging_dir.mkdir(parents=True)
+        service = build_service(config, fake_lmstudio)
+
+        checks = service.doctor()
+
+        check = next(c for c in checks if c.name == "hard-link permission on blobs")
+        assert check.ok is True
+        assert "ok" in check.details
+        assert not any(
+            probe.name.startswith(".studiolink-probe-")
+            for probe in config.import_staging_dir.iterdir()
+        )
+
+    def test_probe_reports_unlinkable_blobs(
+        self, make_config, fake_lmstudio, monkeypatch
+    ):
+        config = make_config()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        config.import_staging_dir.mkdir(parents=True)
+        service = build_service(config, fake_lmstudio)
+
+        def denied(source, target, *args, **kwargs):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(service_module.os, "link", denied)
+
+        checks = service.doctor()
+
+        check = next(c for c in checks if c.name == "hard-link permission on blobs")
+        assert check.ok is False
+        assert "FAILED" in check.details
+        assert "fs.protected_hardlinks" in check.details
+
+    def test_probe_skips_without_blobs(self, make_config, fake_lmstudio):
+        config = make_config()
+        for directory in (
+            config.ollama_manifests_dir,
+            config.ollama_blobs_dir,
+            config.lmstudio_models_dir,
+        ):
+            directory.mkdir(parents=True)
+        service = build_service(config, fake_lmstudio)
+
+        checks = service.doctor()
+
+        check = next(c for c in checks if c.name == "hard-link permission on blobs")
+        assert check.ok is True
+        assert "skipped" in check.details
+
+    def test_doctor_checks_lm_studio_inventory(self, make_config, fake_lmstudio):
+        config = make_config()
+        config.ollama_manifests_dir.mkdir(parents=True)
+        config.ollama_blobs_dir.mkdir(parents=True)
+        config.lmstudio_models_dir.mkdir(parents=True)
+        service = build_service(config, fake_lmstudio)
+
+        checks = service.doctor()
+
+        check = next(c for c in checks if c.name == "lm studio model inventory")
+        assert check.ok is True
+        assert "indexed" in check.details
+
+
+class TestPruneSweepsCopyStaging:
+    def test_sweeps_copy_staging_leftovers(self, make_config, fake_lmstudio):
+        # Copy-mode aliases are removed after each import; anything found in
+        # .studiolink-imports survived a crash and pins blob space.
+        config = make_config()
+        service = build_service(config, fake_lmstudio)
+        write_manifest(config, digest=DIGEST_A)
+        blob = write_blob(config, DIGEST_A)
+        model = OllamaAdapter(config).scan_models()[0]
+        copy_staging = config.ollama_models_dir / ".studiolink-imports"
+        copy_staging.mkdir(parents=True)
+        leftover = copy_staging / "crashed-leftover.gguf"
+        leftover.write_bytes(b"GGUFxxxx")
+        healthy = copy_staging / model.import_filename
+        os.link(blob, healthy)
+
+        report = service.prune()
+
+        removed = {result.path for result in report.aliases if result.removed}
+        assert leftover in removed
+        assert healthy.exists()

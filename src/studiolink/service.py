@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from studiolink.config import StudioLinkConfig
-from studiolink.lmstudio_adapter import LMStudioAdapter
+from studiolink.lmstudio_adapter import LMStudioAdapter, LMStudioError
 from studiolink.models import (
     ArtifactRole,
     DoctorCheck,
@@ -85,7 +85,18 @@ class StudioLinkService:
             and records.get(model.canonical_name) is not None
             for model in models
         )
-        inventory = self.lmstudio.list_models() if needs_inventory else None
+        inventory: tuple[LMStudioModel, ...] | None = None
+        if needs_inventory:
+            try:
+                inventory = self.lmstudio.list_models()
+            except LMStudioError as exc:
+                # A broken lms must not take the whole status command down;
+                # without inventory evidence vision bundles read as pending.
+                logger.warning(
+                    "Could not list LM Studio models (%s); projector bundles "
+                    "will be reported as pending",
+                    exc,
+                )
         return [
             StatusEntry(
                 model=model,
@@ -174,8 +185,20 @@ class StudioLinkService:
         }
 
         alias_results: list[PruneResult] = []
-        staging = self.config.import_staging_dir
-        if staging.exists():
+        # Copy mode stages temporary aliases inside the Ollama store; they are
+        # removed after each import, so anything found there survived a crash
+        # or a cleanup failure and pins blob space until it is swept.
+        staging_dirs = list(
+            dict.fromkeys(
+                [
+                    self.config.import_staging_dir,
+                    self.config.ollama_models_dir / ".studiolink-imports",
+                ]
+            )
+        )
+        for staging in staging_dirs:
+            if not staging.exists():
+                continue
             for path in sorted(staging.iterdir()):
                 if not path.is_file():
                     continue
@@ -267,6 +290,7 @@ class StudioLinkService:
                 str(self.config.lmstudio_models_dir),
             ),
             self._volume_compatibility_check(),
+            self._hard_link_permission_check(),
         ]
 
         try:
@@ -296,6 +320,19 @@ class StudioLinkService:
         except Exception as exc:
             logger.debug("Doctor: LM Studio capabilities check failed: %s", exc)
             checks.append(DoctorCheck("lm studio import capabilities", False, str(exc)))
+
+        try:
+            inventory = self.lmstudio.list_models()
+            checks.append(
+                DoctorCheck(
+                    "lm studio model inventory",
+                    True,
+                    f"{len(inventory)} model(s) indexed",
+                )
+            )
+        except Exception as exc:
+            logger.debug("Doctor: LM Studio inventory check failed: %s", exc)
+            checks.append(DoctorCheck("lm studio model inventory", False, str(exc)))
 
         models = self.scan()
         checks.append(
@@ -372,6 +409,61 @@ class StudioLinkService:
             f"{label}: device {device}" for label, device in devices.items()
         )
         return DoctorCheck("hard-link volume compatibility", ok, details)
+
+    def _hard_link_permission_check(self) -> DoctorCheck:
+        """Probe that a real blob can actually be hard-linked into staging.
+
+        Same-volume checks (st_dev) cannot catch policies such as Linux
+        fs.protected_hardlinks, which blocks linking a blob the user cannot
+        write - the typical layout when Ollama runs as a system service. The
+        probe links a real blob under a temporary name and removes it again.
+        """
+        name = "hard-link permission on blobs"
+        blob = self._any_blob_file()
+        if blob is None:
+            return DoctorCheck(name, True, "skipped: no blobs present")
+        destinations = list(
+            dict.fromkeys(
+                [
+                    self.config.import_staging_dir,
+                    self.config.ollama_models_dir / ".studiolink-imports",
+                ]
+            )
+        )
+        outcomes: list[str] = []
+        ok = True
+        for destination in destinations:
+            if not destination.is_dir():
+                outcomes.append(f"{destination}: skipped (not created yet)")
+                continue
+            probe = destination / f".studiolink-probe-{os.getpid()}"
+            try:
+                probe.unlink(missing_ok=True)
+                os.link(blob, probe)
+            except OSError as exc:
+                ok = False
+                outcomes.append(
+                    f"{destination}: FAILED ({exc}); blobs must be linkable "
+                    "here - on Linux check blob ownership and "
+                    "fs.protected_hardlinks, or use --copy"
+                )
+            else:
+                outcomes.append(f"{destination}: ok")
+            finally:
+                try:
+                    probe.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return DoctorCheck(name, ok, "; ".join(outcomes))
+
+    def _any_blob_file(self) -> Path | None:
+        blobs = self.config.ollama_blobs_dir
+        if not blobs.is_dir():
+            return None
+        for path in sorted(blobs.iterdir()):
+            if path.is_file():
+                return path
+        return None
 
     def _record_is_synced(
         self,

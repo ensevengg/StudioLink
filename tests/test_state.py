@@ -157,3 +157,31 @@ class TestRecordSchema:
     def test_record_from_json_requires_fields(self):
         with pytest.raises(KeyError):
             SyncRecord.from_json({"canonical_name": "m:1"})
+
+
+class TestStateDurability:
+    def test_loads_state_saved_with_utf8_bom(self, tmp_path):
+        # Regression: an editor that saves state.json with a BOM used to make
+        # every record disappear ("Starting fresh") and re-import everything.
+        path = tmp_path / "state.json"
+        record = make_sync_record("llama3:1b", DIGEST_A)
+        StateStore(path).upsert(record)
+        raw = path.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")
+        path.write_bytes(b"\xef\xbb\xbf" + raw)
+
+        restored = StateStore(path).get_record("llama3:1b")
+
+        assert restored is not None
+        assert restored.canonical_name == "llama3:1b"
+        assert restored.digest == DIGEST_A
+
+    def test_save_leaves_no_temp_files_behind(self, tmp_path):
+        path = tmp_path / "state.json"
+        store = StateStore(path)
+
+        store.upsert(make_sync_record("llama3:1b", DIGEST_A))
+        store.upsert(make_sync_record("llama3:2b", DIGEST_A))
+
+        assert [item.name for item in path.parent.iterdir()] == [path.name]
+        assert len(store.get_all_records()) == 2

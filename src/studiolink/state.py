@@ -61,19 +61,31 @@ class StateStore:
             return None
 
     def _save_raw(self, records: Mapping[str, object]) -> None:
-        """Persist raw JSON dict to disk atomically."""
+        """Persist raw JSON dict to disk atomically and durably."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps({"schema_version": 2, "sync_records": records}, indent=2)
-        tmp_path = self.path.parent / (self.path.name + ".tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        os.replace(tmp_path, self.path)
+        # A per-process temp name keeps concurrent writers from interleaving
+        # writes into one file, and fsync before the replace keeps a crash
+        # from leaving a truncated state file behind.
+        tmp_path = self.path.parent / f"{self.path.name}.tmp-{os.getpid()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     def _load_raw(self) -> dict[str, object]:
         """Load raw JSON dict from disk."""
         if not self.path.exists():
             return {}
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            # utf-8-sig tolerates editors that save the file with a BOM;
+            # a strict read would discard every record as "corrupted".
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
             logger.warning(
                 "Corrupted state file at %s: %s. Starting fresh.", self.path, exc

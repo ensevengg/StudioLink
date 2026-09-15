@@ -249,7 +249,12 @@ class TestVersionCompare:
         assert cli._version_tuple("1.0.0") > cli._version_tuple("0.99.99")
 
     def test_versions_with_suffixes_do_not_crash(self):
-        assert cli._version_tuple("0.1.0rc1") == (0, 1, 1)
+        # Regression: "1rc1" used to concatenate its digits into 11, so a
+        # pre-release compared as newer than any 0.1.x release. Suffixes are
+        # now truncated, so a pre-release never looks newer than its release.
+        assert cli._version_tuple("0.1.0rc1") == (0, 1, 0)
+        assert not cli._version_tuple("0.1.0rc1") > cli._version_tuple("0.1.0")
+        assert cli._version_tuple("0.1.1") > cli._version_tuple("0.1.0rc1")
 
 
 class TestUpgradeCommand:

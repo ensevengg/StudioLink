@@ -37,6 +37,11 @@ def same_file(left: Path, right: Path) -> bool:
         left_stat, right_stat = left.stat(), right.stat()
     except OSError:
         return False
+    if left_stat.st_ino == 0 or right_stat.st_ino == 0:
+        # Filesystems without file ids (FAT/exFAT) report inode 0, which
+        # would make every file on the volume compare equal and reuse a
+        # stale alias. Identity is unknowable there, so never match.
+        return False
     return (left_stat.st_dev, left_stat.st_ino) == (
         right_stat.st_dev,
         right_stat.st_ino,
@@ -113,24 +118,30 @@ class Syncer:
                 message="already synced according to StudioLink state",
                 record=existing,
             )
-        if model.readiness is ModelReadiness.STALE:
-            logger.debug("Model %s has a missing artifact", model.canonical_name)
-            return SyncResult(
-                model=model,
-                status="error",
-                message=(
-                    "model artifact is missing from the Ollama blob store; "
-                    f"run `ollama pull {model.canonical_name}` to restore it"
-                ),
-            )
-        if model.readiness is ModelReadiness.INVALID:
-            logger.debug("Model %s is invalid: %s", model.canonical_name, model.issues)
-            return SyncResult(
-                model=model,
-                status="error",
-                message="model is not ready for import: "
-                + "; ".join(model.issues or ("unknown error",)),
-            )
+        if not already_synced:
+            # A complete import that Ollama can no longer back is still fine
+            # to keep; only a model we are about to (re-)import must be
+            # blocked by stale or invalid artifacts.
+            if model.readiness is ModelReadiness.STALE:
+                logger.debug("Model %s has a missing artifact", model.canonical_name)
+                return SyncResult(
+                    model=model,
+                    status="error",
+                    message=(
+                        "model artifact is missing from the Ollama blob store; "
+                        f"run `ollama pull {model.canonical_name}` to restore it"
+                    ),
+                )
+            if model.readiness is ModelReadiness.INVALID:
+                logger.debug(
+                    "Model %s is invalid: %s", model.canonical_name, model.issues
+                )
+                return SyncResult(
+                    model=model,
+                    status="error",
+                    message="model is not ready for import: "
+                    + "; ".join(model.issues or ("unknown error",)),
+                )
 
         artifacts = self._model_artifacts(model)
         if import_mode is ImportMode.DIRECT and len(artifacts) > 1:
@@ -147,6 +158,7 @@ class Syncer:
             (artifact.role, artifact.digest): artifact
             for artifact in (existing.artifacts if existing is not None else ())
         }
+        destination_dir = self.config.lmstudio_models_dir / model.import_user_repo
         completed: list[SyncedArtifact] = []
         last_result: ImportResult | None = None
         imported_at = (
@@ -156,13 +168,14 @@ class Syncer:
         )
 
         for artifact in artifacts:
-            if artifact.digest is None or artifact.blob_path is None:
-                return SyncResult(
-                    model=model,
-                    status="error",
-                    message=f"{artifact.role.value} artifact is not importable",
-                )
-            prior = existing_by_identity.get((artifact.role, artifact.digest))
+            # A None digest can never match a stored record (records always
+            # carry a real digest), so the importability check below reports
+            # it after the reuse lookup.
+            prior = (
+                existing_by_identity.get((artifact.role, artifact.digest))
+                if artifact.digest is not None
+                else None
+            )
             prior_target = prior.imported_model_path if prior is not None else None
             if prior is not None and prior_target is None:
                 prior_target = (
@@ -174,6 +187,11 @@ class Syncer:
                 prior is not None
                 and prior_target is not None
                 and prior_target.is_file()
+                # A changed sibling digest also changes import_user_repo.
+                # Reusing the artifact from the old bundle directory would
+                # split the pair across LM Studio directories and break
+                # vision pairing, so re-import into the current destination.
+                and prior_target.parent == destination_dir
             ):
                 completed.append(
                     SyncedArtifact(
@@ -186,6 +204,13 @@ class Syncer:
                     )
                 )
                 continue
+
+            if artifact.digest is None or artifact.blob_path is None:
+                return SyncResult(
+                    model=model,
+                    status="error",
+                    message=f"{artifact.role.value} artifact is not importable",
+                )
 
             if import_mode is ImportMode.DIRECT:
                 alias_path = artifact.blob_path
@@ -257,7 +282,11 @@ class Syncer:
                     import_command=import_result.command,
                 )
             )
-            if not dry_run:
+            if not dry_run and any(
+                artifact.role is ArtifactRole.MODEL for artifact in completed
+            ):
+                # Never persist a partial without the model artifact: its
+                # serialization requires a primary.
                 partial = self._make_record(
                     model, completed, link_mode, imported_at, vision_confirmed=False
                 )
@@ -358,7 +387,9 @@ class Syncer:
         dry_run: bool,
     ) -> SyncResult:
         record = None
-        if completed:
+        if completed and any(
+            artifact.role is ArtifactRole.MODEL for artifact in completed
+        ):
             record = self._make_record(
                 model,
                 completed,
@@ -454,14 +485,19 @@ def _ensure_import_alias(
         # The alias survived a re-pull but now points at the old blob content;
         # replace it so we never import stale weights.
         logger.debug("Replacing stale import alias: %s", alias_path)
-        alias_path.unlink()
-    staging_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            alias_path.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to replace stale import alias {alias_path}: {exc}"
+            ) from exc
     try:
+        staging_dir.mkdir(parents=True, exist_ok=True)
         os.link(blob_path, alias_path)
-        logger.debug("Created hard link: %s -> %s", alias_path, blob_path)
-        return alias_path, True
     except OSError as exc:
         raise RuntimeError(f"Failed to create import alias (hard link): {exc}") from exc
+    logger.debug("Created hard link: %s -> %s", alias_path, blob_path)
+    return alias_path, True
 
 
 def _format_import_message(result: ImportResult) -> str:

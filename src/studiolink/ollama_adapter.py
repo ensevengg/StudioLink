@@ -156,6 +156,10 @@ class OllamaAdapter:
         for role in sorted(unsupported_roles):
             issues.append(f"Ollama {role} layers are not supported")
 
+        # Import order is semantic: partial sync records must always contain
+        # the model artifact, so normalize model layers before projectors
+        # regardless of the order the manifest lists them in.
+        artifact_layers.sort(key=lambda entry: entry[2] is not ArtifactRole.MODEL)
         artifacts = tuple(
             self._parse_artifact(layer, role, index)
             for index, layer, role in artifact_layers
