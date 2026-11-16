@@ -115,6 +115,18 @@ def test_state_loss_does_not_adopt_unrelated_file(library):
     assert target.read_bytes() == b"other content"
 
 
+def test_converting_identical_tags_to_copy_reuses_one_copy(library):
+    config, service, _, _, blob = library
+    write_manifest(config, tag="another")
+    service.sync(sync_all=True)
+    results = service.sync(sync_all=True, link_mode=LinkMode.COPY)
+    assert all(result.status == "synced" for result in results)
+    targets = [destination(config, model) for model in service.scan()]
+    assert len(targets) == 2
+    assert targets[0].samefile(targets[1])
+    assert not targets[0].samefile(blob)
+
+
 def test_direct_tags_sharing_a_target_can_change_to_copy(library):
     config, service, _, _, blob = library
     write_manifest(config, tag="another")
@@ -222,6 +234,18 @@ def test_replaced_blob_same_digest_is_relinked(library):
     assert not service.status()[0].synced
     assert service.sync(sync_all=True)[0].status == "synced"
     assert destination(config, service.scan()[0]).samefile(blob)
+
+
+def test_copy_tags_share_one_destination_allocation(library):
+    config, service, _, _, blob = library
+    write_manifest(config, tag="latest")
+    assert all(
+        r.status == "synced"
+        for r in service.sync(sync_all=True, link_mode=LinkMode.COPY)
+    )
+    targets = [destination(config, m) for m in service.scan()]
+    assert targets[0].samefile(targets[1])
+    assert not targets[0].samefile(blob)
 
 
 def test_dry_run_does_not_replace_existing_alias(library):

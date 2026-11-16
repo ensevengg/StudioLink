@@ -232,6 +232,15 @@ class Syncer:
                         stderr="",
                         return_code=0,
                     )
+                elif link_mode is LinkMode.COPY and self._reuse_copy(
+                    model, records, target
+                ):
+                    import_result = ImportResult(
+                        command=(),
+                        stdout="Reused existing copy of identical weights",
+                        stderr="",
+                        return_code=0,
+                    )
                 else:
                     import_result = self.lmstudio.import_model(
                         str(alias_path.absolute()),
@@ -313,6 +322,32 @@ class Syncer:
             record=record,
         )
 
+    def _reuse_copy(
+        self, model: OllamaModel, records: dict[str, SyncRecord], target: Path
+    ) -> bool:
+        if model.blob_path is None:
+            return False
+        for record in records.values():
+            if (
+                record.digest != model.model_digest
+                or record.link_mode is not LinkMode.COPY
+            ):
+                continue
+            source = record_destination(record, self.config.lmstudio_models_dir)
+            if source == target or not healthy_destination(
+                source, model.blob_path, LinkMode.COPY, record
+            ):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(source, target)
+            except OSError as exc:
+                if exc.errno in (errno.EXDEV, errno.ENOTSUP):
+                    continue
+                raise
+            return True
+        return False
+
     def _replace_destination(
         self,
         source: Path,
@@ -328,7 +363,7 @@ class Syncer:
                 os.link(source.resolve(), temporary)
             elif mode is LinkMode.SYMBOLIC_LINK:
                 temporary.symlink_to(source.absolute())
-            else:
+            elif not self._reuse_copy(model, records, temporary):
                 shutil.copyfile(source, temporary)
             os.replace(temporary, target)
 
