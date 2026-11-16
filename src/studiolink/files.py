@@ -10,6 +10,22 @@ if TYPE_CHECKING:
     from studiolink.models import LinkMode, OllamaArtifact, SyncedArtifact, SyncRecord
 
 
+def link_target(path: Path) -> Path:
+    """Return the absolute path a symlink points to, without following chains.
+
+    Windows reports absolute targets in their ``\\\\?\\`` extended-length
+    form, which never compares equal to the paths StudioLink records, so strip
+    it before resolving the target against the link's directory.
+    """
+    raw = os.readlink(path)
+    if os.name == "nt":
+        if raw.startswith("\\\\?\\UNC\\"):
+            raw = "\\\\" + raw[len("\\\\?\\UNC\\") :]
+        elif raw.startswith("\\\\?\\"):
+            raw = raw[len("\\\\?\\") :]
+    return Path(os.path.abspath(path.parent / raw))
+
+
 def same_file(left: Path, right: Path) -> bool:
     """Check whether two paths reference the same inode (hard link)."""
     try:
@@ -79,8 +95,7 @@ def owns_destination(record: SyncRecord, artifact: SyncedArtifact, path: Path) -
             return identity(path) == artifact.imported_identity
         # Legacy records have no file identity. Require evidence before removal.
         if path.is_symlink():
-            target = path.parent / os.readlink(path)
-            return target.absolute() == artifact.import_alias_path.absolute()
+            return link_target(path) == artifact.import_alias_path.absolute()
         for source in (artifact.import_alias_path, artifact.blob_path):
             if same_file(path, source):
                 return True
@@ -170,6 +185,5 @@ def symlink_references(root: Path) -> dict[Path, set[Path]]:
         for name in (*dirs, *files):
             path = Path(directory) / name
             if path.is_symlink():
-                target = Path(os.path.abspath(path.parent / os.readlink(path)))
-                references.setdefault(target, set()).add(path)
+                references.setdefault(link_target(path), set()).add(path)
     return references

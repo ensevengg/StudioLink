@@ -16,6 +16,10 @@ from studiolink.models import PruneResult
 from studiolink.state import StateStore
 
 TRANSACTIONS = ".studiolink-transactions"
+# errno values meaning "this filesystem cannot hard-link"; Windows reports
+# ERROR_INVALID_FUNCTION (1) or ERROR_NOT_SUPPORTED (50) through winerror.
+_NO_HARDLINK_ERRNOS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
+_NO_HARDLINK_WINERRORS = frozenset({1, 50})
 MARKER = "owner.json"
 
 
@@ -118,7 +122,10 @@ def publish_import(staged: Path, target: Path) -> None:
         try:
             os.link(staged, target)
         except OSError as exc:
-            if exc.errno not in (errno.EPERM, errno.ENOTSUP):
+            if (
+                exc.errno not in _NO_HARDLINK_ERRNOS
+                and getattr(exc, "winerror", None) not in _NO_HARDLINK_WINERRORS
+            ):
                 raise
             _rename_without_overwrite(staged, target)
     staged.unlink(missing_ok=True)
