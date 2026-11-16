@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 from studiolink.models import SyncRecord
@@ -14,6 +15,46 @@ logger = logging.getLogger("studiolink")
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+
+    @contextmanager
+    def lock(self):
+        """Serialize import/prune transactions across processes; never wait forever."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, 2)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+
+                def acquire():
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+                def release():
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                def acquire():
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                def release():
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+            try:
+                acquire()
+            except OSError as exc:
+                raise RuntimeError(
+                    "Another StudioLink sync/prune is running; retry when it finishes"
+                ) from exc
+            try:
+                yield
+            finally:
+                release()
 
     def get_record(self, name: str) -> SyncRecord | None:
         """Get a single sync record by model name."""
@@ -74,7 +115,7 @@ class StateStore:
             return {}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeError) as exc:
             logger.warning(
                 "Corrupted state file at %s: %s. Starting fresh.", self.path, exc
             )

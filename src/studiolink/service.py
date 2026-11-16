@@ -116,6 +116,10 @@ class StudioLinkService:
         return syncer.sync(selected, mode, import_mode, dry_run)
 
     def prune(self, *, dry_run: bool = False) -> PruneReport:
+        with self.state.lock():
+            return self._prune_locked(dry_run=dry_run)
+
+    def _prune_locked(self, *, dry_run: bool = False) -> PruneReport:
         """Safely remove unneeded aliases and stale sync records.
 
         Destructive work requires a complete Ollama scan, and aliases needed

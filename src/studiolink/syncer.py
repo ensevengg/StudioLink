@@ -61,6 +61,16 @@ class Syncer:
             import_mode,
             dry_run,
         )
+        with self.state.lock():
+            return self._sync_locked(models, link_mode, import_mode, dry_run)
+
+    def _sync_locked(
+        self,
+        models: list[OllamaModel],
+        link_mode: LinkMode,
+        import_mode: ImportMode,
+        dry_run: bool,
+    ) -> list[SyncResult]:
         records = self.state.get_all_records()
         logger.debug("Loaded %d existing sync record(s)", len(records))
         results: list[SyncResult] = []

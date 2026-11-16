@@ -220,3 +220,21 @@ def make_syncer(make_config, fake_lmstudio):
         return syncer, cfg, fake_lmstudio
 
     return _make
+
+
+class FilesystemLMStudio(FakeLMStudio):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+@pytest.fixture
+def library(make_config):
+    config = make_config()
+    adapter = FilesystemLMStudio(config)
+    from studiolink.service import StudioLinkService
+
+    service = StudioLinkService(config=config, lmstudio=adapter)
+    manifest = write_manifest(config)
+    blob = write_blob(config, DIGEST_A)
+    return config, service, adapter, manifest, blob
