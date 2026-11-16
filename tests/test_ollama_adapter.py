@@ -189,14 +189,14 @@ class TestMalformedManifests:
         broken = write_manifest(config, repository="broken", digest=DIGEST_A)
         write_manifest(config, repository="healthy", digest=DIGEST_A)
         write_blob(config, DIGEST_A)
-        real_read_text = Path.read_text
+        real_read_bytes = Path.read_bytes
 
-        def flaky_read_text(path, *args, **kwargs):
+        def flaky_read_bytes(path, *args, **kwargs):
             if path == broken:
                 raise OSError("access denied")
-            return real_read_text(path, *args, **kwargs)
+            return real_read_bytes(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", flaky_read_text)
+        monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
 
         report = OllamaAdapter(config).scan_report()
 

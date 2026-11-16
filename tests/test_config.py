@@ -13,6 +13,7 @@ class TestEnvOverrides:
         config = StudioLinkConfig.from_env()
         assert config.ollama_models_dir == custom
         assert config.ollama_manifests_dir == custom / "manifests"
+        assert config.ollama_manifests_v2_path == custom / "manifests-v2"
         assert config.ollama_blobs_dir == custom / "blobs"
 
     def test_state_dir_override_derives_paths(self, monkeypatch, tmp_path):

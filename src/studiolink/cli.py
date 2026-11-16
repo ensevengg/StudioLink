@@ -154,7 +154,11 @@ def main(argv: list[str] | None = None) -> int:
 
     service = StudioLinkService()
     logger.debug("Configuration loaded:")
-    logger.debug("  Ollama manifests: %s", service.config.ollama_manifests_dir)
+    logger.debug(
+        "  Ollama manifests: %s (v2), %s (legacy)",
+        service.config.ollama_manifests_v2_path,
+        service.config.ollama_manifests_dir,
+    )
     logger.debug("  Ollama blobs: %s", service.config.ollama_blobs_dir)
     logger.debug("  LM Studio models: %s", service.config.lmstudio_models_dir)
     logger.debug("  State file: %s", service.config.state_file)

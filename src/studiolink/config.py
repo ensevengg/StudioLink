@@ -63,6 +63,15 @@ class StudioLinkConfig:
     state_file: Path
     import_staging_dir: Path
     default_link_mode: LinkMode = LinkMode.HARD_LINK
+    # Ollama 0.40+ writes named manifests to manifests-v2/; None derives it
+    # from ollama_models_dir.
+    ollama_manifests_v2_dir: Path | None = None
+
+    @property
+    def ollama_manifests_v2_path(self) -> Path:
+        if self.ollama_manifests_v2_dir is not None:
+            return self.ollama_manifests_v2_dir
+        return self.ollama_models_dir / "manifests-v2"
 
     @classmethod
     def from_env(cls) -> "StudioLinkConfig":
@@ -85,6 +94,7 @@ class StudioLinkConfig:
             ),
             ollama_models_dir=ollama_models_dir,
             ollama_manifests_dir=ollama_models_dir / "manifests",
+            ollama_manifests_v2_dir=ollama_models_dir / "manifests-v2",
             ollama_blobs_dir=ollama_models_dir / "blobs",
             lmstudio_models_dir=_expand_path(
                 "STUDIOLINK_LMSTUDIO_MODELS_DIR",

@@ -71,7 +71,9 @@ class StudioLinkService:
 
     def scan_report(self) -> OllamaScanReport:
         logger.debug(
-            "Scanning Ollama manifests at %s", self.config.ollama_manifests_dir
+            "Scanning Ollama manifests at %s and %s",
+            self.config.ollama_manifests_v2_path,
+            self.config.ollama_manifests_dir,
         )
         report = self.ollama.scan_report()
         logger.debug("Discovered %d model(s)", len(report.models))
@@ -344,8 +346,10 @@ class StudioLinkService:
             ),
             DoctorCheck(
                 "ollama manifests dir",
-                self.config.ollama_manifests_dir.exists(),
-                str(self.config.ollama_manifests_dir),
+                self.config.ollama_manifests_v2_path.is_dir()
+                or self.config.ollama_manifests_dir.is_dir(),
+                f"{self.config.ollama_manifests_v2_path} (Ollama 0.40+), "
+                f"{self.config.ollama_manifests_dir} (legacy)",
             ),
             DoctorCheck(
                 "ollama blobs dir",

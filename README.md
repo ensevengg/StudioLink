@@ -161,7 +161,7 @@ sdl doctor --json
 **Checks include:**
 - Ollama executable exists
 - LM Studio CLI (`lms`) exists
-- Ollama manifests and blobs directories exist
+- Ollama manifests (`manifests-v2/` from Ollama 0.40+, or legacy `manifests/`) and blobs directories exist
 - LM Studio models directory exists
 - Hard-link filesystem/volume compatibility
 - Hard-link permission on blobs (a real link is created and removed again, catching restrictions such as Linux `fs.protected_hardlinks`)
@@ -220,7 +220,7 @@ The LM Studio models override must match the models directory selected in LM Stu
 
 ## How It Works
 
-1. **Scanning** - Reads manifest files from the configured Ollama models directory
+1. **Scanning** - Reads named manifests from both `manifests-v2/` (Ollama 0.40+, links to content-addressed manifest blobs) and the legacy `manifests/` tree, preferring v2 when a name exists in both. For Ollama manifest lists it picks the llama.cpp GGUF child, falling back to the `ggml` child; internal `llamacpp:<digest>` downgrade tags are ignored
 2. **Artifact Resolution** - Locates the primary model and optional projector GGUF in Ollama's content-addressed blob directory
 3. **Validation** - Checks every required artifact's SHA-256 digest syntax, GGUF magic bytes, and the blob size declared in the manifest
 4. **Import Aliases** - Creates digest-keyed, human-readable `.gguf` aliases; projectors use the LM Studio-recognized `mmproj-` prefix. Copy mode uses temporary aliases on Ollama's filesystem, removed after the import; other modes use `~/.studiolink/imports/`
@@ -236,6 +236,9 @@ The model manifest exists but the actual blob file has been deleted or purged by
 ```powershell
 ollama pull <model-name>
 ```
+
+### "Ollama MLX (safetensors) models are not supported"
+The model only has an MLX build in Ollama (common on Apple Silicon), which has no GGUF file for LM Studio to import. Pull a GGUF variant of the model, or download it in LM Studio directly.
 
 ### Hard link fails (cross-volume)
 Hard links require the Ollama blob store, the StudioLink state directory, and the LM Studio models directory to live on the same filesystem/volume. If they don't, the sync reports a hard-link error; retry with copy mode instead:
