@@ -6,7 +6,7 @@ StudioLink is a Python CLI tool that bridges Ollama and LM Studio. It treats Oll
 
 ## Features
 
-- 🔍 **Scan** - Discover all GGUF models available in your Ollama library
+- 🔍 **Scan** - Discover all GGUF models and supported vision projectors in your Ollama library
 - 🔄 **Sync** - Import models into LM Studio with one command
 - 📊 **Status** - Track which models are synced and their current state
 - 🩺 **Doctor** - Verify prerequisites and diagnose issues
@@ -113,7 +113,7 @@ sdl -v sync --all
 - `--copy` - Use copy mode instead of hard links
 - `--hard-link` - Force hard link mode (default)
 - `--symbolic-link` - Use symbolic links
-- `--direct` - Import the Ollama blob directly without a human-readable alias
+- `--direct` - Import a single-artifact Ollama blob directly without a human-readable alias; model-plus-projector bundles require aliases
 
 ### `sdl status`
 Show discovered models and their sync state.
@@ -164,6 +164,8 @@ sdl doctor --json
 - Ollama manifests and blobs directories exist
 - LM Studio models directory exists
 - Hard-link filesystem/volume compatibility
+- Hard-link permission on blobs (a real link is created and removed again, catching restrictions such as Linux `fs.protected_hardlinks`)
+- LM Studio model inventory (`lms ls --json`; required to verify projector bundles)
 - Discovered Ollama models
 - Blob presence validation
 - GGUF header validation
@@ -196,9 +198,9 @@ When scanning or checking status, models can have these states:
 
 | State | Description | Action Required |
 |-------|-------------|-----------------|
-| **ready** | Model blob exists and has valid GGUF header | Ready to sync |
-| **stale** | Manifest exists but blob is missing | Run `ollama pull <model>` to restore |
-| **invalid** | Blob exists but missing GGUF magic bytes | Model may be corrupted |
+| **ready** | Every required model/projector blob exists and has a valid GGUF header | Ready to sync |
+| **stale** | A required model/projector blob is missing | Run `ollama pull <model>` to restore |
+| **invalid** | An artifact is malformed or the manifest uses an unsupported artifact combination | Inspect the reported issues |
 | **synced** | Already imported into LM Studio | No action needed |
 | **pending** | Ready but not yet synced | Run `sdl sync` |
 
@@ -219,12 +221,13 @@ The LM Studio models override must match the models directory selected in LM Stu
 ## How It Works
 
 1. **Scanning** - Reads manifest files from the configured Ollama models directory
-2. **Blob Resolution** - Locates GGUF blobs in Ollama's content-addressed blob directory
-3. **Validation** - Checks SHA-256 digest syntax, GGUF magic bytes, and the blob size declared in the manifest
-4. **Import Aliases** - Creates digest-keyed, human-readable `.gguf` aliases. Copy mode uses a temporary alias on Ollama's filesystem, removed after the import; other modes use `~/.studiolink/imports/`
-5. **LM Studio Import** - Uses `lms import` to stage and verify the requested link/copy, then publishes the destination without overwriting an existing file. Failed imports clean up partial files; subsequent sync or prune recovers abandoned transactions after a process crash
-6. **State Tracking** - Saves destination paths and file identities to `~/.studiolink/state.json` (written atomically), verifies imports before skipping, and repairs missing destinations. Sync and prune operations share a process lock.
-7. **Cleanup** - Successful replacement imports remove the previous managed destination and alias. `sdl prune` removes obsolete tracked imports and orphaned aliases; its dry run counts shared file data once.
+2. **Artifact Resolution** - Locates the primary model and optional projector GGUF in Ollama's content-addressed blob directory
+3. **Validation** - Checks every required artifact's SHA-256 digest syntax, GGUF magic bytes, and the blob size declared in the manifest
+4. **Import Aliases** - Creates digest-keyed, human-readable `.gguf` aliases; projectors use the LM Studio-recognized `mmproj-` prefix. Copy mode uses temporary aliases on Ollama's filesystem, removed after the import; other modes use `~/.studiolink/imports/`
+5. **LM Studio Import** - Uses one `lms import` call per artifact to stage and verify the requested link/copy, then publishes each destination without overwriting an existing file. Each model/projector pair lands in the same digest-isolated repository so a re-pull cannot leave LM Studio choosing an older projector. Failed imports clean up partial files; subsequent sync or prune recovers abandoned transactions after a process crash
+6. **State Tracking** - Saves resumable per-artifact destination paths and file identities to schema-v2 `~/.studiolink/state.json` (written atomically; schema-v1 records remain readable). Sync and prune operations share a process lock.
+7. **Reconciliation** - Status and sync verify every imported file before skipping, repair missing destinations, and confirm projector bundles through `lms ls --json`. An import whose Ollama blob was deleted stays synced only while it is the unchanged file StudioLink recorded.
+8. **Cleanup** - Successful replacement imports remove the previous managed destinations and aliases; a failed re-pull keeps the previous import tracked. `sdl prune` removes obsolete tracked imports and orphaned aliases after a complete Ollama scan; its dry run counts shared file data once.
 
 ## Troubleshooting
 
@@ -260,7 +263,9 @@ Run `sdl doctor` to verify:
 - **State persistence** - Tracks and verifies actual imports to avoid redundant operations; state is written atomically and corrupt records are skipped. Verified existing files can restore lost state.
 - **Copy deduplication** - Tags with identical weights share one destination copy through hard links when the destination filesystem supports them.
 - **Dry runs** - Preview sync actions without replacing aliases or invoking an import.
-- **Prune over leak** - Obsolete tracked destinations and orphaned aliases are cleaned up with `sdl prune` instead of pinning disk space forever
+- **Prune over leak** - Obsolete tracked destinations and orphaned aliases are cleaned up with `sdl prune` instead of pinning disk space forever; symbolic-link dependencies are retained
+- **Supported bundles** - Any number of Ollama models can be synced; each manifest may contain one primary model GGUF and at most one projector GGUF
+- **Explicit limitations** - Manifests with multiple primary models/projectors or Ollama adapter, draft, or tensor artifacts are reported as unsupported rather than partially imported
 - **CLI-only** - No GUI, designed for automation and scripting
 
 ## License

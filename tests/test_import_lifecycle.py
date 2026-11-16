@@ -218,12 +218,27 @@ def test_copy_can_stage_across_filesystems_without_extra_copy(library, monkeypat
     assert destination(config, model).read_bytes() == blob.read_bytes()
 
 
-def test_deleted_blob_is_not_reported_synced(library):
-    _, service, _, _, blob = library
+def test_deleted_blob_keeps_only_an_unchanged_import_synced(library):
+    # A hard link holds the weights itself, but without the blob only the
+    # recorded file identity proves the import still is what was synced.
+    config, service, _, _, blob = library
     service.sync(sync_all=True)
     blob.unlink()
+    assert service.status()[0].display_status == "synced"
+    assert service.sync(sync_all=True)[0].status == "skipped"
+    destination(config, service.scan()[0]).write_bytes(b"GGUFchanged")
     assert service.status()[0].display_status == "stale"
     assert service.sync(sync_all=True)[0].status == "error"
+
+
+def test_deleted_blob_unsyncs_symbolic_import(library):
+    # A symlink records no identity of the weights it reaches.
+    _, service, _, _, blob = library
+    mode = LinkMode.SYMBOLIC_LINK
+    service.sync(sync_all=True, link_mode=mode)
+    blob.unlink()
+    assert service.status()[0].display_status == "stale"
+    assert service.sync(sync_all=True, link_mode=mode)[0].status == "error"
 
 
 def test_replaced_blob_same_digest_is_relinked(library):

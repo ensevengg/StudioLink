@@ -31,6 +31,32 @@ class ModelReadiness(StrEnum):
     INVALID = "invalid"
 
 
+class ArtifactRole(StrEnum):
+    MODEL = "model"
+    PROJECTOR = "projector"
+
+
+@dataclass(slots=True, frozen=True)
+class OllamaArtifact:
+    role: ArtifactRole
+    media_type: str
+    digest: str | None
+    blob_path: Path | None
+    declared_size: int | None
+    blob_size: int | None
+    gguf_valid: bool
+    manifest_index: int
+    issues: tuple[str, ...] = ()
+
+    @property
+    def readiness(self) -> ModelReadiness:
+        if self.gguf_valid:
+            return ModelReadiness.READY
+        if any("blob is missing" in issue for issue in self.issues):
+            return ModelReadiness.STALE
+        return ModelReadiness.INVALID
+
+
 @dataclass(slots=True, frozen=True)
 class OllamaModel:
     canonical_name: str
@@ -46,11 +72,25 @@ class OllamaModel:
     blob_size: int | None
     gguf_valid: bool
     issues: tuple[str, ...] = ()
+    artifacts: tuple[OllamaArtifact, ...] = ()
 
     @property
     def readiness(self) -> ModelReadiness:
         if self.gguf_valid:
             return ModelReadiness.READY
+        if any("not supported" in issue for issue in self.issues):
+            return ModelReadiness.INVALID
+        if self.artifacts:
+            if any(
+                artifact.readiness is ModelReadiness.INVALID
+                for artifact in self.artifacts
+            ):
+                return ModelReadiness.INVALID
+            if any(
+                artifact.readiness is ModelReadiness.STALE
+                for artifact in self.artifacts
+            ):
+                return ModelReadiness.STALE
         if any(
             "blob is missing from the Ollama blob store" in issue
             for issue in self.issues
@@ -77,10 +117,29 @@ class OllamaModel:
         return f"ollama/{'-'.join(repo_parts)}"
 
     @property
+    def import_user_repo(self) -> str:
+        if not any(
+            artifact.role is ArtifactRole.PROJECTOR for artifact in self.artifacts
+        ):
+            return self.user_repo
+        identity = "-".join(
+            (artifact.digest or "unknown").split(":")[-1][:12]
+            for artifact in self.artifacts
+        )
+        return f"{self.user_repo}--bundle-{identity}"
+
+    @property
     def import_filename(self) -> str:
+        return self._import_filename(self.model_digest)
+
+    def artifact_import_filename(self, artifact: OllamaArtifact) -> str:
+        prefix = "mmproj-" if artifact.role is ArtifactRole.PROJECTOR else ""
+        return prefix + self._import_filename(artifact.digest)
+
+    def _import_filename(self, digest: str | None) -> str:
         # Keep the hash portion of the digest so re-pulled models (same name,
         # new digest) get a distinct alias instead of reusing the stale one.
-        digest_hash = (self.model_digest or "unknown").split(":")[-1][:12]
+        digest_hash = (digest or "unknown").split(":")[-1][:12]
         raw = f"{self.canonical_name}-{digest_hash}"
         safe = "".join(
             ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in raw
@@ -98,98 +157,240 @@ class OllamaScanReport:
     errors: tuple[str, ...] = ()
 
 
+def _parse_identity(raw: object) -> tuple[int, int, int, int] | None:
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 4
+        or not all(isinstance(value, int) for value in raw)
+    ):
+        raise TypeError("imported_identity must contain four integers")
+    return raw[0], raw[1], raw[2], raw[3]
+
+
 @dataclass(slots=True, frozen=True)
-class SyncRecord:
-    canonical_name: str
+class SyncedArtifact:
+    role: ArtifactRole
     digest: str
     blob_path: Path
     import_alias_path: Path
-    user_repo: str
-    link_mode: LinkMode
-    imported_at: datetime
-    import_command: tuple[str, ...] = field(default_factory=tuple)
     imported_model_path: Path | None = None
+    import_command: tuple[str, ...] = field(default_factory=tuple)
     imported_identity: tuple[int, int, int, int] | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
-            "canonical_name": self.canonical_name,
+            "role": self.role.value,
             "digest": self.digest,
             "blob_path": str(self.blob_path),
             "import_alias_path": str(self.import_alias_path),
+            "imported_model_path": (
+                None
+                if self.imported_model_path is None
+                else str(self.imported_model_path)
+            ),
+            "import_command": list(self.import_command),
+            "imported_identity": (
+                None if self.imported_identity is None else list(self.imported_identity)
+            ),
+        }
+
+    @classmethod
+    def from_json(cls, payload: dict[str, object]) -> "SyncedArtifact":
+        import_command = payload.get("import_command", [])
+        if not isinstance(import_command, list):
+            raise TypeError("import_command must be a list")
+        return cls(
+            role=ArtifactRole(str(payload["role"])),
+            digest=str(payload["digest"]),
+            blob_path=Path(str(payload["blob_path"])),
+            import_alias_path=Path(str(payload["import_alias_path"])),
+            imported_model_path=(
+                Path(str(payload["imported_model_path"]))
+                if payload.get("imported_model_path")
+                else None
+            ),
+            import_command=tuple(str(item) for item in import_command),
+            imported_identity=_parse_identity(payload.get("imported_identity")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
+class SyncRecord:
+    canonical_name: str
+    user_repo: str
+    link_mode: LinkMode
+    imported_at: datetime
+    artifacts: tuple[SyncedArtifact, ...]
+    vision_confirmed: bool = True
+
+    @property
+    def primary_artifact(self) -> SyncedArtifact:
+        for artifact in self.artifacts:
+            if artifact.role is ArtifactRole.MODEL:
+                return artifact
+        raise ValueError(
+            f"sync record for {self.canonical_name!r} has no model artifact"
+        )
+
+    # Compatibility properties for callers and schema-v1 JSON consumers.
+    @property
+    def digest(self) -> str:
+        return self.primary_artifact.digest
+
+    @property
+    def blob_path(self) -> Path:
+        return self.primary_artifact.blob_path
+
+    @property
+    def import_alias_path(self) -> Path:
+        return self.primary_artifact.import_alias_path
+
+    @property
+    def imported_model_path(self) -> Path | None:
+        return self.primary_artifact.imported_model_path
+
+    @property
+    def import_command(self) -> tuple[str, ...]:
+        return self.primary_artifact.import_command
+
+    def to_json(self) -> dict[str, object]:
+        primary = self.primary_artifact
+        return {
+            "canonical_name": self.canonical_name,
             "user_repo": self.user_repo,
             "link_mode": self.link_mode.value,
             "imported_at": self.imported_at.isoformat(),
-            "import_command": list(self.import_command),
-            "imported_model_path": str(self.imported_model_path)
-            if self.imported_model_path
-            else None,
-            "imported_identity": list(self.imported_identity)
-            if self.imported_identity
-            else None,
+            "artifacts": [artifact.to_json() for artifact in self.artifacts],
+            "vision_confirmed": self.vision_confirmed,
+            # Keep the original primary-artifact fields additive for CLI JSON
+            # consumers while state schema v2 adopts the artifacts collection.
+            "digest": primary.digest,
+            "blob_path": str(primary.blob_path),
+            "import_alias_path": str(primary.import_alias_path),
+            "imported_model_path": (
+                None
+                if primary.imported_model_path is None
+                else str(primary.imported_model_path)
+            ),
+            "import_command": list(primary.import_command),
         }
 
     @classmethod
     def from_json(cls, payload: dict[str, object]) -> "SyncRecord":
-        import_command = payload.get("import_command", [])
-        if not isinstance(import_command, list):
-            raise TypeError("import_command must be a list")
-        raw_identity = payload.get("imported_identity")
-        imported_identity = None
-        if raw_identity is not None:
-            if (
-                not isinstance(raw_identity, list)
-                or len(raw_identity) != 4
-                or not all(isinstance(value, int) for value in raw_identity)
-            ):
-                raise TypeError("imported_identity must contain four integers")
-            imported_identity = (
-                raw_identity[0],
-                raw_identity[1],
-                raw_identity[2],
-                raw_identity[3],
+        artifacts_payload = payload.get("artifacts")
+        if artifacts_payload is not None:
+            if not isinstance(artifacts_payload, list):
+                raise TypeError("artifacts must be a list")
+            artifacts = tuple(
+                SyncedArtifact.from_json(item)
+                for item in artifacts_payload
+                if isinstance(item, dict)
             )
+            if len(artifacts) != len(artifacts_payload) or not artifacts:
+                raise TypeError("artifacts must contain artifact objects")
+        else:
+            import_command = payload.get("import_command", [])
+            if not isinstance(import_command, list):
+                raise TypeError("import_command must be a list")
+            artifacts = (
+                SyncedArtifact(
+                    role=ArtifactRole.MODEL,
+                    digest=str(payload["digest"]),
+                    blob_path=Path(str(payload["blob_path"])),
+                    import_alias_path=Path(str(payload["import_alias_path"])),
+                    imported_model_path=(
+                        Path(str(payload["imported_model_path"]))
+                        if payload.get("imported_model_path")
+                        else None
+                    ),
+                    import_command=tuple(str(item) for item in import_command),
+                    imported_identity=_parse_identity(payload.get("imported_identity")),
+                ),
+            )
+        if sum(artifact.role is ArtifactRole.MODEL for artifact in artifacts) != 1:
+            raise ValueError("sync record must contain exactly one model artifact")
+        if sum(artifact.role is ArtifactRole.PROJECTOR for artifact in artifacts) > 1:
+            raise ValueError("sync record cannot contain multiple projector artifacts")
         return cls(
             canonical_name=str(payload["canonical_name"]),
-            digest=str(payload["digest"]),
-            blob_path=Path(str(payload["blob_path"])),
-            import_alias_path=Path(str(payload["import_alias_path"])),
             user_repo=str(payload["user_repo"]),
             link_mode=LinkMode(str(payload["link_mode"])),
             imported_at=datetime.fromisoformat(str(payload["imported_at"])),
-            imported_model_path=Path(str(payload["imported_model_path"]))
-            if payload.get("imported_model_path")
-            else None,
-            imported_identity=imported_identity,
-            import_command=tuple(str(item) for item in import_command),
+            artifacts=artifacts,
+            vision_confirmed=(
+                payload.get("vision_confirmed") is True
+                if any(
+                    artifact.role is ArtifactRole.PROJECTOR for artifact in artifacts
+                )
+                else True
+            ),
         )
+
+
+def model_artifacts(model: OllamaModel) -> tuple[OllamaArtifact, ...]:
+    """Artifacts to import; models built without a manifest scan have one."""
+    if model.artifacts:
+        return model.artifacts
+    if model.model_digest is None or model.blob_path is None:
+        return ()
+    return (
+        OllamaArtifact(
+            role=ArtifactRole.MODEL,
+            media_type="application/vnd.ollama.image.model",
+            digest=model.model_digest,
+            blob_path=model.blob_path,
+            declared_size=model.declared_size,
+            blob_size=model.blob_size,
+            gguf_valid=model.gguf_valid,
+            manifest_index=0,
+            issues=model.issues,
+        ),
+    )
 
 
 def is_synced(
     model: OllamaModel, record: SyncRecord | None, models_dir: Path | None = None
 ) -> bool:
-    """A saved digest is insufficient: the imported file must still work."""
-    from studiolink.files import healthy_destination, record_destination
+    """A saved digest is insufficient: every imported file must still work.
 
-    if (
-        record is None
-        or record.digest != model.model_digest
-        or model.readiness is not ModelReadiness.READY
-        or model.blob_path is None
-        or not model.blob_present
-    ):
+    An import whose Ollama blob has since gone missing still counts while the
+    file is verifiably the one StudioLink created; it needs nothing from Ollama.
+    """
+    from studiolink.files import artifact_destination, intact_destination
+
+    if record is None or model.readiness is ModelReadiness.INVALID:
+        return False
+    sources = model_artifacts(model)
+    expected = tuple((artifact.role, artifact.digest) for artifact in sources)
+    actual = tuple((artifact.role, artifact.digest) for artifact in record.artifacts)
+    if not sources or actual != expected:
+        return False
+    if len(sources) > 1 and not record.vision_confirmed:
         return False
     try:
-        target = (
-            record_destination(record, models_dir)
-            if models_dir
-            else record.imported_model_path
-        )
-        return target is not None and healthy_destination(
-            target, model.blob_path, record.link_mode, record
-        )
+        for source, artifact in zip(sources, record.artifacts):
+            target = (
+                artifact_destination(record, artifact, models_dir)
+                if models_dir
+                else artifact.imported_model_path
+            )
+            if target is None or not intact_destination(
+                target, source, record.link_mode, artifact
+            ):
+                return False
     except (OSError, ValueError):
         return False
+    return True
+
+
+@dataclass(slots=True, frozen=True)
+class LMStudioModel:
+    model_key: str
+    path: str
+    vision: bool
+    model_type: str
 
 
 @dataclass(slots=True, frozen=True)

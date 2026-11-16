@@ -3,15 +3,18 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from studiolink.config import StudioLinkConfig
-from studiolink.files import owns_destination, record_destination, symlink_references
-from studiolink.lmstudio_adapter import LMStudioAdapter
+from studiolink.files import artifact_destination, owns_destination, symlink_references
+from studiolink.lmstudio_adapter import LMStudioAdapter, LMStudioError
 from studiolink.models import (
+    ArtifactRole,
     DoctorCheck,
     ImportMode,
     LinkMode,
+    LMStudioModel,
     ModelReadiness,
     OllamaModel,
     OllamaScanReport,
@@ -20,10 +23,11 @@ from studiolink.models import (
     SyncRecord,
     SyncResult,
     is_synced,
+    model_artifacts,
 )
 from studiolink.ollama_adapter import OllamaAdapter
 from studiolink.state import StateStore
-from studiolink.syncer import Syncer, same_file
+from studiolink.syncer import Syncer, bundle_is_indexed, same_file
 from studiolink.transactions import recover_imports
 
 if TYPE_CHECKING:
@@ -76,13 +80,33 @@ class StudioLinkService:
     def status(self) -> list[StatusEntry]:
         models = self.scan()
         records = self.state.get_all_records()
+        needs_inventory = any(
+            model.readiness is not ModelReadiness.INVALID
+            and any(
+                artifact.role is ArtifactRole.PROJECTOR for artifact in model.artifacts
+            )
+            and records.get(model.canonical_name) is not None
+            for model in models
+        )
+        inventory: tuple[LMStudioModel, ...] | None = None
+        if needs_inventory:
+            try:
+                inventory = self.lmstudio.list_models()
+            except LMStudioError as exc:
+                # A broken lms must not take the whole status command down;
+                # without inventory evidence vision bundles read as pending.
+                logger.warning(
+                    "Could not list LM Studio models (%s); projector bundles "
+                    "will be reported as pending",
+                    exc,
+                )
         return [
             StatusEntry(
                 model=model,
-                synced=is_synced(
+                synced=self._record_is_synced(
                     model,
                     records.get(model.canonical_name),
-                    self.config.lmstudio_models_dir,
+                    inventory=inventory,
                 ),
                 sync_record=records.get(model.canonical_name),
             )
@@ -141,28 +165,42 @@ class StudioLinkService:
         models = list(scan.models)
         current = {m.canonical_name: m for m in models}
         records = self.state.get_all_records()
+        root = self.config.lmstudio_models_dir
+        staging_dir = self.config.import_staging_dir
+
+        def superseded(record: SyncRecord, model: OllamaModel) -> bool:
+            # A partial bundle record is a subset of the model, not obsolete.
+            wanted = {(a.role, a.digest) for a in model_artifacts(model)}
+            return any((a.role, a.digest) not in wanted for a in record.artifacts)
+
         stale = {
             name: record
             for name, record in records.items()
             if name not in current
             or (
                 current[name].readiness is ModelReadiness.READY
-                and record.digest != current[name].model_digest
+                and superseded(record, current[name])
             )
         }
         protected_aliases = {
-            record.import_alias_path
+            artifact.import_alias_path
             for name, record in records.items()
             if name not in stale
+            for artifact in record.artifacts
         }
         protected_targets = {
-            record_destination(record, self.config.lmstudio_models_dir)
+            artifact_destination(record, artifact, root)
             for name, record in records.items()
             if name not in stale
+            for artifact in record.artifacts
         }
-        recovered = recover_imports(self.config.lmstudio_models_dir, dry_run=dry_run)
-        references = symlink_references(self.config.lmstudio_models_dir)
-        expected = {m.import_filename: m for m in models}
+        recovered = recover_imports(root, dry_run=dry_run)
+        references = symlink_references(root)
+        expected = {
+            model.artifact_import_filename(artifact): (model, artifact.blob_path)
+            for model in models
+            for artifact in model_artifacts(model)
+        }
         imports: list[PruneResult] = list(recovered)
         aliases: list[PruneResult] = []
         removed_names: list[str] = []
@@ -211,37 +249,45 @@ class StudioLinkService:
             return dry_run or removed
 
         for name, record in stale.items():
-            target = record_destination(record, self.config.lmstudio_models_dir)
-            if (
-                record.link_mode is LinkMode.SYMBOLIC_LINK
-                and record.imported_model_path is None
+            if record.link_mode is LinkMode.SYMBOLIC_LINK and any(
+                artifact.imported_model_path is None for artifact in record.artifacts
             ):
                 # A legacy record does not identify which symlink depends on this alias.
-                protected_aliases.add(record.import_alias_path)
+                protected_aliases.update(
+                    artifact.import_alias_path for artifact in record.artifacts
+                )
                 continue
-            if target not in protected_targets and (
-                target.exists() or target.is_symlink()
-            ):
-                if not owns_destination(record, target):
-                    logger.warning("Keeping changed or unverified import: %s", target)
-                    protected_aliases.add(record.import_alias_path)
-                    continue
-                if not remove(
-                    target, "model removed from Ollama or superseded", imports
+            reclaimed = True
+            for artifact in record.artifacts:
+                target = artifact_destination(record, artifact, root)
+                alias = artifact.import_alias_path
+                if target not in protected_targets and (
+                    target.exists() or target.is_symlink()
                 ):
-                    protected_aliases.add(record.import_alias_path)
-                    continue
-            alias = record.import_alias_path
-            if (
-                alias not in protected_aliases
-                and alias.parent.resolve() == self.config.import_staging_dir.resolve()
-            ):
-                if not remove(alias, "obsolete import alias", aliases):
-                    continue
-            removed_names.append(name)
+                    if not owns_destination(record, artifact, target):
+                        logger.warning(
+                            "Keeping changed or unverified import: %s", target
+                        )
+                        protected_aliases.add(alias)
+                        reclaimed = False
+                        continue
+                    if not remove(
+                        target, "model removed from Ollama or superseded", imports
+                    ):
+                        protected_aliases.add(alias)
+                        reclaimed = False
+                        continue
+                if (
+                    alias not in protected_aliases
+                    and alias.parent.resolve() == staging_dir.resolve()
+                ):
+                    if not remove(alias, "obsolete import alias", aliases):
+                        reclaimed = False
+            if reclaimed:
+                removed_names.append(name)
 
         for staging in (
-            self.config.import_staging_dir,
+            staging_dir,
             self.config.ollama_models_dir / ".studiolink-imports",
         ):
             if staging.is_dir():
@@ -252,23 +298,23 @@ class StudioLinkService:
                         or not (path.is_file() or path.is_symlink())
                     ):
                         continue
-                    model = expected.get(path.name)
-                    # An invalid/incomplete manifest isn't proof its alias is obsolete.
+                    match = expected.get(path.name)
+                    # Copy mode deletes its aliases after every import, so only
+                    # the hard-link/symlink staging directory holds live ones.
+                    # An invalid/incomplete manifest isn't proof its alias is
+                    # obsolete.
                     if (
-                        staging == self.config.import_staging_dir
-                        and model is not None
+                        staging == staging_dir
+                        and match is not None
                         and (
-                            model.readiness is not ModelReadiness.READY
-                            or (
-                                model.blob_path is not None
-                                and same_file(path, model.blob_path)
-                            )
+                            match[0].readiness is not ModelReadiness.READY
+                            or (match[1] is not None and same_file(path, match[1]))
                         )
                     ):
                         continue
                     reason = (
                         "alias no longer points at the current model blob"
-                        if model
+                        if match
                         else "model no longer present in Ollama (or was re-pulled)"
                     )
                     remove(path, reason, aliases)
@@ -312,6 +358,7 @@ class StudioLinkService:
                 str(self.config.lmstudio_models_dir),
             ),
             self._volume_compatibility_check(),
+            self._hard_link_permission_check(),
         ]
 
         try:
@@ -341,6 +388,19 @@ class StudioLinkService:
         except Exception as exc:
             logger.debug("Doctor: LM Studio capabilities check failed: %s", exc)
             checks.append(DoctorCheck("lm studio import capabilities", False, str(exc)))
+
+        try:
+            inventory = self.lmstudio.list_models()
+            checks.append(
+                DoctorCheck(
+                    "lm studio model inventory",
+                    True,
+                    f"{len(inventory)} model(s) indexed",
+                )
+            )
+        except Exception as exc:
+            logger.debug("Doctor: LM Studio inventory check failed: %s", exc)
+            checks.append(DoctorCheck("lm studio model inventory", False, str(exc)))
 
         models = self.scan()
         checks.append(
@@ -417,6 +477,77 @@ class StudioLinkService:
             f"{label}: device {device}" for label, device in devices.items()
         )
         return DoctorCheck("hard-link volume compatibility", ok, details)
+
+    def _hard_link_permission_check(self) -> DoctorCheck:
+        """Probe that a real blob can actually be hard-linked into staging.
+
+        Same-volume checks (st_dev) cannot catch policies such as Linux
+        fs.protected_hardlinks, which blocks linking a blob the user cannot
+        write - the typical layout when Ollama runs as a system service. The
+        probe links a real blob under a temporary name and removes it again.
+        """
+        name = "hard-link permission on blobs"
+        blob = self._any_blob_file()
+        if blob is None:
+            return DoctorCheck(name, True, "skipped: no blobs present")
+        destinations = list(
+            dict.fromkeys(
+                [
+                    self.config.import_staging_dir,
+                    self.config.ollama_models_dir / ".studiolink-imports",
+                ]
+            )
+        )
+        outcomes: list[str] = []
+        ok = True
+        for destination in destinations:
+            if not destination.is_dir():
+                outcomes.append(f"{destination}: skipped (not created yet)")
+                continue
+            probe = destination / f".studiolink-probe-{os.getpid()}"
+            try:
+                probe.unlink(missing_ok=True)
+                os.link(blob, probe)
+            except OSError as exc:
+                ok = False
+                outcomes.append(
+                    f"{destination}: FAILED ({exc}); blobs must be linkable "
+                    "here - on Linux check blob ownership and "
+                    "fs.protected_hardlinks, or use --copy"
+                )
+            else:
+                outcomes.append(f"{destination}: ok")
+            finally:
+                try:
+                    probe.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return DoctorCheck(name, ok, "; ".join(outcomes))
+
+    def _any_blob_file(self) -> Path | None:
+        blobs = self.config.ollama_blobs_dir
+        if not blobs.is_dir():
+            return None
+        for path in sorted(blobs.iterdir()):
+            if path.is_file():
+                return path
+        return None
+
+    def _record_is_synced(
+        self,
+        model: OllamaModel,
+        record: SyncRecord | None,
+        *,
+        inventory: tuple[LMStudioModel, ...] | None = None,
+    ) -> bool:
+        root = self.config.lmstudio_models_dir
+        if record is None or not is_synced(model, record, root):
+            return False
+        if not any(
+            artifact.role is ArtifactRole.PROJECTOR for artifact in model.artifacts
+        ):
+            return True
+        return inventory is not None and bundle_is_indexed(record, root, inventory)
 
     def _select_models(
         self, discovered: list[OllamaModel], requested_names: list[str]

@@ -7,14 +7,24 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from studiolink.models import LinkMode, SyncRecord
+    from studiolink.models import LinkMode, OllamaArtifact, SyncedArtifact, SyncRecord
 
 
 def same_file(left: Path, right: Path) -> bool:
+    """Check whether two paths reference the same inode (hard link)."""
     try:
-        return left.samefile(right)
+        left_stat, right_stat = left.stat(), right.stat()
     except OSError:
         return False
+    if left_stat.st_ino == 0 or right_stat.st_ino == 0:
+        # Filesystems without file ids (FAT/exFAT) report inode 0, which
+        # would make every file on the volume compare equal and reuse a
+        # stale alias. Identity is unknowable there, so never match.
+        return False
+    return (left_stat.st_dev, left_stat.st_ino) == (
+        right_stat.st_dev,
+        right_stat.st_ino,
+    )
 
 
 def identity(path: Path) -> tuple[int, int, int, int]:
@@ -43,15 +53,17 @@ def destination_path(root: Path, user_repo: str, filename: str) -> Path:
     return root.absolute().joinpath(*parts, Path(filename).name)
 
 
-def record_destination(record: SyncRecord, root: Path) -> Path:
-    path = record.imported_model_path or destination_path(
-        root, record.user_repo, record.import_alias_path.name
+def artifact_destination(
+    record: SyncRecord, artifact: SyncedArtifact, root: Path
+) -> Path:
+    path = artifact.imported_model_path or destination_path(
+        root, record.user_repo, artifact.import_alias_path.name
     )
     # Resolve the parent only: the imported file itself may be a symlink to Ollama.
     if not path.parent.resolve().is_relative_to(root.resolve()):
         # LM Studio's library may have moved since the record was saved. Check
         # its expected location under the new root; never delete the old path.
-        path = destination_path(root, record.user_repo, record.import_alias_path.name)
+        path = destination_path(root, record.user_repo, artifact.import_alias_path.name)
     if not path.parent.resolve().is_relative_to(root.resolve()):
         raise ValueError(
             f"Import directory resolves outside the configured models directory: {path}"
@@ -59,17 +71,17 @@ def record_destination(record: SyncRecord, root: Path) -> Path:
     return path
 
 
-def owns_destination(record: SyncRecord, path: Path) -> bool:
+def owns_destination(record: SyncRecord, artifact: SyncedArtifact, path: Path) -> bool:
     from studiolink.models import LinkMode
 
     try:
-        if record.imported_identity is not None:
-            return identity(path) == record.imported_identity
+        if artifact.imported_identity is not None:
+            return identity(path) == artifact.imported_identity
         # Legacy records have no file identity. Require evidence before removal.
         if path.is_symlink():
             target = path.parent / os.readlink(path)
-            return target.absolute() == record.import_alias_path.absolute()
-        for source in (record.import_alias_path, record.blob_path):
+            return target.absolute() == artifact.import_alias_path.absolute()
+        for source in (artifact.import_alias_path, artifact.blob_path):
             if same_file(path, source):
                 return True
             if record.link_mode is LinkMode.COPY and equal_contents(path, source):
@@ -80,7 +92,7 @@ def owns_destination(record: SyncRecord, path: Path) -> bool:
 
 
 def healthy_destination(
-    path: Path, blob: Path, mode: LinkMode, record: SyncRecord | None = None
+    path: Path, blob: Path, mode: LinkMode, artifact: SyncedArtifact | None = None
 ) -> bool:
     from studiolink.models import LinkMode
 
@@ -95,9 +107,35 @@ def healthy_destination(
             return False
         if path.stat().st_size != blob.stat().st_size:
             return False
-        if record is not None and record.imported_identity is not None:
-            return identity(path) == record.imported_identity
+        if artifact is not None and artifact.imported_identity is not None:
+            return identity(path) == artifact.imported_identity
         return equal_contents(path, blob)
+    except OSError:
+        return False
+
+
+def intact_destination(
+    path: Path, source: OllamaArtifact, mode: LinkMode, artifact: SyncedArtifact
+) -> bool:
+    """Check an import against its Ollama blob, or its own identity if that's gone."""
+    from studiolink.models import ModelReadiness
+
+    blob = source.blob_path
+    if source.readiness is ModelReadiness.INVALID or blob is None:
+        return False
+    # Check the blob now rather than trusting the scan: it may have gone since.
+    if blob.exists():
+        return healthy_destination(path, blob, mode, artifact)
+    # A hard link or copy keeps working without the blob, but only an unchanged
+    # file StudioLink recorded is evidence that it still holds those weights. A
+    # symlink's own identity says nothing about the weights it reaches.
+    try:
+        return (
+            artifact.imported_identity is not None
+            and path.is_file()
+            and not path.is_symlink()
+            and identity(path) == artifact.imported_identity
+        )
     except OSError:
         return False
 
@@ -105,17 +143,20 @@ def healthy_destination(
 def remove_import(
     record: SyncRecord, root: Path, staging: Path, *, keep: set[Path]
 ) -> None:
-    path = record_destination(record, root)
-    if path not in keep and (path.exists() or path.is_symlink()):
-        if not owns_destination(record, path):
-            raise RuntimeError(
-                f"Refusing to remove a changed or unverified import: {path}"
-            )
-        path.unlink()
-    alias = record.import_alias_path
-    if alias.parent.resolve() == staging.resolve() and alias not in keep:
-        if alias.absolute() not in symlink_references(root):
-            alias.unlink(missing_ok=True)
+    for artifact in record.artifacts:
+        path = artifact_destination(record, artifact, root)
+        if path not in keep and (path.exists() or path.is_symlink()):
+            if not owns_destination(record, artifact, path):
+                raise RuntimeError(
+                    f"Refusing to remove a changed or unverified import: {path}"
+                )
+            path.unlink()
+    references = symlink_references(root)
+    for artifact in record.artifacts:
+        alias = artifact.import_alias_path
+        if alias.parent.resolve() == staging.resolve() and alias not in keep:
+            if alias.absolute() not in references:
+                alias.unlink(missing_ok=True)
 
 
 def symlink_references(root: Path) -> dict[Path, set[Path]]:

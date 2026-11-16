@@ -90,6 +90,44 @@ existing content-addressed blob; the fixture now reuses that blob as Ollama does
 - Malformed manifests, incomplete scans, missing mounts, mismatched LM Studio
   paths, and replaced files receive more defensive handling.
 
+## Integration with projector bundles — 2026-10-22
+
+PRs #2 (Ollama projector bundles) and #3 (reliability audit, 0.3.1) were merged
+into their stacked parent branches instead of `main`, so this branch was written
+without them. They were merged in from `support-artifact-bundles` (`3ddc769`).
+The merge commit adapts this branch's guarantees to multi-artifact records:
+
+- Verification, transactional replacement, lost-state recovery, copy reuse and
+  reclamation run per artifact. Each `SyncedArtifact` records its own file
+  identity, and a bundle is synced only when every artifact is verified and
+  LM Studio's inventory pairs the projector with the model.
+- A failed bundle import saves resumable progress only when that does not drop
+  a previous import from state. A failed re-pull therefore keeps the old bundle
+  tracked until a complete replacement can reclaim it; the retry adopts the
+  verified files from the failed attempt instead of importing them again.
+- Where the two lines disagreed, the merge settles on:
+  - **Deleted Ollama blob.** #3 kept such imports synced; this branch reported
+    them as errors. A hard-link or copy import now stays synced only while its
+    recorded identity is unchanged. Symbolic links, modified files and legacy
+    records without an identity fall back to the stale error and pull hint.
+  - **Copy-mode staging.** #3 kept `.studiolink-imports` aliases matching a
+    current blob; prune now removes everything there, because copy mode deletes
+    its aliases after every locked import and any survivor pins blob space.
+  - **Stale alias replacement.** Aliases are replaced atomically rather than
+    unlinked first; a failed replacement is still a per-model error.
+- Size mismatches between the manifest and blob now apply to projectors too.
+
+| Check | Result |
+| --- | --- |
+| Linux, Python 3.12, including real `lms` | 281 passed |
+| Linux, Python 3.13 and 3.14 | 254 passed, 27 opt-in real-CLI tests skipped |
+| Ruff lint and formatting, Pyright | Passed, 0 errors |
+| Source distribution and wheel build | Passed |
+
+Real `lms` imported a model/projector pair through the transaction directory
+into one bundle repository. The sandbox has no LM Studio daemon, so `lms ls`
+vision pairing was not confirmed live; it is covered with the fake inventory.
+
 ## Reproduction
 
 From the checkout, with `uv` available:

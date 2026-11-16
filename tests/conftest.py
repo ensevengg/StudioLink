@@ -19,9 +19,12 @@ if str(_SRC) not in sys.path:
 from studiolink.config import StudioLinkConfig  # noqa: E402
 from studiolink.lmstudio_adapter import LMStudioError  # noqa: E402
 from studiolink.models import (  # noqa: E402
+    ArtifactRole,
     ImportResult,
     LinkMode,
+    LMStudioModel,
     OllamaModel,
+    SyncedArtifact,
     SyncRecord,
 )
 
@@ -143,12 +146,17 @@ def make_sync_record(
 ) -> SyncRecord:
     return SyncRecord(
         canonical_name=canonical_name,
-        digest=digest,
-        blob_path=Path("blob"),
-        import_alias_path=Path("alias"),
         user_repo="ollama/llama3",
         link_mode=LinkMode.HARD_LINK,
         imported_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        artifacts=(
+            SyncedArtifact(
+                role=ArtifactRole.MODEL,
+                digest=digest,
+                blob_path=Path("blob"),
+                import_alias_path=Path("alias"),
+            ),
+        ),
     )
 
 
@@ -159,12 +167,41 @@ class FakeLMStudio:
         self.calls: list[dict] = []
         self.fail_for: set[str] = set()
         self.timeout_for: set[str] = set()
+        self.config: StudioLinkConfig | None = None
+        self.models_dir: Path | None = None
+        self.inventory_override: tuple[LMStudioModel, ...] | None = None
+
+    def _root(self) -> Path | None:
+        if self.config is not None:
+            return self.config.lmstudio_models_dir
+        return self.models_dir
 
     def get_version(self) -> str | None:
         return "0.3.17 (fake)"
 
     def get_import_capabilities(self) -> set[LinkMode]:
         return {LinkMode.HARD_LINK, LinkMode.COPY, LinkMode.SYMBOLIC_LINK}
+
+    def list_models(self) -> tuple[LMStudioModel, ...]:
+        if self.inventory_override is not None:
+            return self.inventory_override
+        root = self._root()
+        if root is None or not root.exists():
+            return ()
+        inventory = []
+        for path in root.rglob("*.gguf"):
+            if path.name.startswith("mmproj-"):
+                continue
+            relative = path.relative_to(root)
+            inventory.append(
+                LMStudioModel(
+                    model_key=path.stem,
+                    path=relative.as_posix(),
+                    vision=any(path.parent.glob("mmproj-*.gguf")),
+                    model_type="llm",
+                )
+            )
+        return tuple(inventory)
 
     def import_model(
         self,
@@ -191,9 +228,9 @@ class FakeLMStudio:
             )
         if source_path in self.timeout_for:
             raise subprocess.TimeoutExpired(cmd=["lms"], timeout=3600)
-        config = getattr(self, "config", None)
-        if config is not None and not dry_run:
-            target = config.lmstudio_models_dir / user_repo / Path(source_path).name
+        root = self._root()
+        if root is not None and not dry_run:
+            target = root / user_repo / Path(source_path).name
             target.parent.mkdir(parents=True, exist_ok=True)
             if link_mode is LinkMode.HARD_LINK:
                 os.link(source_path, target)
