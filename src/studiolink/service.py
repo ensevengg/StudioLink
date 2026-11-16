@@ -210,9 +210,21 @@ class StudioLinkService:
         # Simulate link-count changes in dry runs as well, so an inode shared by
         # several doomed paths is counted exactly once.
         removed_links: dict[tuple[int, int], int] = {}
+        if dry_run:
+            # Recovered transactions are planned removals too; count them so a
+            # shared inode reports its space exactly once.
+            for result in recovered:
+                try:
+                    stat = result.path.lstat()
+                except OSError:
+                    continue
+                key = (stat.st_dev, stat.st_ino)
+                removed_links[key] = removed_links.get(key, 0) + 1
 
         def remove(path, reason, results):
-            if results is aliases and any(
+            # Never break a symlink that still depends on this entry, whether
+            # it is a staging alias or a managed LM Studio destination.
+            if any(
                 ref.is_symlink()
                 for ref in references.get(path.absolute(), ())
                 if ref not in seen

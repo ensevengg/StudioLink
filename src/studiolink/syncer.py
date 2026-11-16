@@ -39,7 +39,11 @@ from studiolink.models import (
 )
 from studiolink.ports import LMStudioPort
 from studiolink.state import StateStore
-from studiolink.transactions import import_transaction, recover_imports
+from studiolink.transactions import (
+    hardlinks_unsupported,
+    import_transaction,
+    recover_imports,
+)
 
 logger = logging.getLogger("studiolink")
 
@@ -162,16 +166,19 @@ class Syncer:
                 ),
             )
         if dry_run:
-            targets = ", ".join(
-                str(
-                    destination_path(
-                        root,
-                        model.import_user_repo,
-                        self._source_path(model, artifact, import_mode).name,
+            try:
+                targets = ", ".join(
+                    str(
+                        destination_path(
+                            root,
+                            model.import_user_repo,
+                            self._source_path(model, artifact, import_mode).name,
+                        )
                     )
+                    for artifact in sources
                 )
-                for artifact in sources
-            )
+            except ValueError as exc:
+                return SyncResult(model=model, status="error", message=str(exc))
             return SyncResult(
                 model=model,
                 status="dry-run",
@@ -199,6 +206,23 @@ class Syncer:
             message = _format_import_message(import_result)
 
         record = self._make_record(model, completed, link_mode)
+        if len(completed) == 1:
+            result = SyncResult(
+                model=model, status="synced", message=message, record=record
+            )
+        else:
+            # Confirm a bundle before reclaiming the one it replaces, so a
+            # bundle LM Studio rejects never costs the previous working one.
+            result = self._confirm_bundle(model, record, "synced", message)
+            if result.status == "error":
+                if existing is not None and not (
+                    self._targets(existing) <= self._targets(record)
+                ):
+                    # Keep the previous import tracked; a retry adopts the
+                    # new files without another copy.
+                    return replace(result, record=None)
+                return result
+            record = result.record or record
         if existing is not None:
             try:
                 self._reclaim(existing, record, records)
@@ -206,11 +230,7 @@ class Syncer:
                 # Keep the old record so its cleanup is retried; the new import
                 # is verified and will be adopted without another copy.
                 return SyncResult(model=model, status="error", message=str(exc))
-        if len(completed) == 1:
-            return SyncResult(
-                model=model, status="synced", message=message, record=record
-            )
-        return self._confirm_bundle(model, record, "synced", message)
+        return result
 
     def _sync_artifact(
         self,
@@ -484,7 +504,8 @@ class Syncer:
                 try:
                     os.link(source, target)
                 except OSError as exc:
-                    if exc.errno in (errno.EXDEV, errno.ENOTSUP):
+                    if exc.errno == errno.EXDEV or hardlinks_unsupported(exc):
+                        # The caller falls back to an ordinary copy.
                         continue
                     raise
                 return True

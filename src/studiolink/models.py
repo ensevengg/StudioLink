@@ -110,7 +110,8 @@ class OllamaModel:
     def user_repo(self) -> str:
         repo_parts = []
         if self.registry != "registry.ollama.ai":
-            repo_parts.append(self.registry.replace(".", "-"))
+            # ":" (a registry port) is not allowed in Windows directory names.
+            repo_parts.append(self.registry.replace(".", "-").replace(":", "-"))
         if self.namespace != "library":
             repo_parts.append(self.namespace)
         repo_parts.append(self.repository.replace("/", "--"))

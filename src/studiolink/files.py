@@ -62,29 +62,42 @@ def equal_contents(left: Path, right: Path) -> bool:
         return False
 
 
+def _contained(root: Path, path: Path) -> Path:
+    """Spell ``path`` under the configured root, rejecting escapes.
+
+    Only the parent is resolved: the imported file itself may be a symlink to
+    Ollama. Re-expressing the resolved parent under ``root`` gives one spelling
+    per destination even when the root or a directory below it is a symlink,
+    so destinations compare equal wherever they were recorded.
+    """
+    try:
+        relative = path.parent.resolve().relative_to(root.resolve())
+    except ValueError:
+        raise ValueError(
+            f"Import directory resolves outside the configured models directory: {path}"
+        ) from None
+    return root.absolute().joinpath(relative, path.name)
+
+
 def destination_path(root: Path, user_repo: str, filename: str) -> Path:
     parts = user_repo.split("/")
     if len(parts) != 2 or any(p in ("", ".", "..") or "\\" in p for p in parts):
         raise ValueError(f"Invalid import repository: {user_repo}")
-    return root.absolute().joinpath(*parts, Path(filename).name)
+    return _contained(root, root.absolute().joinpath(*parts, Path(filename).name))
 
 
 def artifact_destination(
     record: SyncRecord, artifact: SyncedArtifact, root: Path
 ) -> Path:
-    path = artifact.imported_model_path or destination_path(
-        root, record.user_repo, artifact.import_alias_path.name
-    )
-    # Resolve the parent only: the imported file itself may be a symlink to Ollama.
-    if not path.parent.resolve().is_relative_to(root.resolve()):
-        # LM Studio's library may have moved since the record was saved. Check
-        # its expected location under the new root; never delete the old path.
-        path = destination_path(root, record.user_repo, artifact.import_alias_path.name)
-    if not path.parent.resolve().is_relative_to(root.resolve()):
-        raise ValueError(
-            f"Import directory resolves outside the configured models directory: {path}"
-        )
-    return path
+    if artifact.imported_model_path is not None:
+        try:
+            return _contained(root, artifact.imported_model_path)
+        except ValueError:
+            # LM Studio's library may have moved since the record was saved.
+            # Check its expected location under the new root; never delete
+            # the old path.
+            pass
+    return destination_path(root, record.user_repo, artifact.import_alias_path.name)
 
 
 def owns_destination(record: SyncRecord, artifact: SyncedArtifact, path: Path) -> bool:
