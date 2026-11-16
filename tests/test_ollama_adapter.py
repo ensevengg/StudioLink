@@ -29,7 +29,7 @@ class TestScanHappyPath:
         assert model.readiness is ModelReadiness.READY
         assert model.blob_path == config.ollama_blobs_dir / blob_filename(DIGEST_A)
         assert model.blob_size == 12  # 4 header bytes + 8 padding
-        assert model.declared_size == 1234
+        assert model.declared_size == 12
         assert model.issues == ()
 
     def test_declared_size_garbage_is_tolerated(self, make_config):
@@ -191,3 +191,38 @@ class TestManifestLayout:
         write_manifest(config, repository="alpha", tag="1b", digest=DIGEST_A)
         models = OllamaAdapter(config).scan_models()
         assert [m.repository for m in models] == ["alpha", "zeta"]
+
+
+class TestImportValidation:
+    def test_null_layers_does_not_abort_other_models(self, make_config):
+        config = make_config()
+        write_manifest(config, repository="broken", content={"layers": None})
+        write_manifest(config, repository="healthy")
+        write_blob(config, DIGEST_A)
+        models = OllamaAdapter(config).scan_models()
+        assert len(models) == 2
+        assert models[0].readiness is ModelReadiness.INVALID
+        assert models[1].readiness is ModelReadiness.READY
+
+    def test_truncated_blob_is_invalid_even_with_gguf_header(self, make_config):
+        config = make_config()
+        write_manifest(config, size=10000)
+        write_blob(config, DIGEST_A)
+        assert scan_one(config).readiness is ModelReadiness.INVALID
+
+    def test_non_utf8_manifest_does_not_abort_scan(self, make_config):
+        config = make_config()
+        path = write_manifest(config)
+        path.write_bytes(b"\xff")
+        report = OllamaAdapter(config).scan_report()
+        assert not report.complete
+        assert report.errors
+
+    def test_digest_cannot_escape_blob_directory(self, make_config, tmp_path):
+        config = make_config()
+        outside = tmp_path / "outside.gguf"
+        outside.write_bytes(b"GGUF00000000")
+        write_manifest(config, digest=str(outside), size=12)
+        model = scan_one(config)
+        assert model.readiness is ModelReadiness.INVALID
+        assert model.blob_path is None

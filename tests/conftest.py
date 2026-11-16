@@ -86,7 +86,7 @@ def write_manifest(
     repository: str = "llama3",
     tag: str = "1b",
     digest: str = DIGEST_A,
-    size: int = 1234,
+    size: int = 12,
     content: object | None = None,
     raw_text: str | None = None,
 ) -> Path:

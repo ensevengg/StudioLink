@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -36,9 +37,15 @@ class OllamaAdapter:
 
         models: list[OllamaModel] = []
         errors: list[str] = []
+
+        def scan_error(exc: OSError) -> None:
+            raise exc
+
         try:
             manifest_files = sorted(
-                path for path in manifests_dir.rglob("*") if path.is_file()
+                Path(directory) / name
+                for directory, _, names in os.walk(manifests_dir, onerror=scan_error)
+                for name in names
             )
         except OSError as exc:
             message = f"Could not enumerate Ollama manifests: {exc}"
@@ -145,18 +152,20 @@ class OllamaAdapter:
                     ":", "-"
                 )
                 logger.debug("Looking for blob: %s", blob_path)
-                if not blob_path.exists():
-                    logger.debug("Blob not found: %s", blob_path)
-                    issues.append("model blob is missing from the Ollama blob store")
-                else:
+                try:
                     blob_size = blob_path.stat().st_size
-                    logger.debug("Found blob: %s (size=%d bytes)", blob_path, blob_size)
-                    if self._has_gguf_header(blob_path):
-                        logger.debug("Blob has valid GGUF header: %s", blob_path)
-                        gguf_valid = True
-                    else:
-                        logger.debug("Blob missing GGUF magic bytes: %s", blob_path)
+                    gguf_valid = self._has_gguf_header(blob_path)
+                    if not gguf_valid:
                         issues.append("blob does not start with GGUF magic bytes")
+                    if declared_size is not None and blob_size != declared_size:
+                        issues.append(
+                            f"blob size mismatch: expected {declared_size}, found {blob_size}"
+                        )
+                        gguf_valid = False
+                except FileNotFoundError:
+                    issues.append("model blob is missing from the Ollama blob store")
+                except OSError as exc:
+                    issues.append(f"could not read model blob: {exc}")
 
         canonical_name = self._canonical_name(registry, namespace, repository, tag)
         fully_qualified_name = f"{registry}/{namespace}/{repository}:{tag}"
@@ -182,7 +191,7 @@ class OllamaAdapter:
             return None
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     @staticmethod
