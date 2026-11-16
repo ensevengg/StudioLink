@@ -10,7 +10,7 @@ StudioLink is a Python CLI tool that bridges Ollama and LM Studio. It treats Oll
 - 🔄 **Sync** - Import models into LM Studio with one command
 - 📊 **Status** - Track which models are synced and their current state
 - 🩺 **Doctor** - Verify prerequisites and diagnose issues
-- 🧹 **Prune** - Safely remove orphaned aliases without breaking symbolic imports
+- 🧹 **Prune** - Remove obsolete managed imports and aliases to release pinned disk space
 - 🔗 **Smart linking** - Uses hard links by default; pass `--copy` when volumes differ
 - 💾 **State tracking** - Remembers what's been synced to avoid re-importing
 
@@ -18,7 +18,7 @@ StudioLink is a Python CLI tool that bridges Ollama and LM Studio. It treats Oll
 
 Before using StudioLink, ensure you have:
 
-1. **Ollama** installed with a local model library (StudioLink detects current platform defaults and honors `OLLAMA_MODELS`)
+1. **Ollama** installed with a local model library (StudioLink detects platform defaults and honors `OLLAMA_MODELS`)
 2. **LM Studio** with the `lms` CLI installed
 3. **Python 3.12+**
 
@@ -135,9 +135,9 @@ Discovered 3 model(s); 1 tracked as synced.
 ```
 
 ### `sdl prune`
-Remove aliases and sync state that are no longer needed, after first verifying that the Ollama library was scanned completely.
+Remove tracked LM Studio imports, staging aliases, and sync state for models that Ollama no longer has or has replaced.
 
-Space recovery depends on the import mode. A copied import can leave the staging alias as the last reference to Ollama's former blob, while an LM Studio hard link continues to retain the model data after the staging alias is removed. Aliases required by symbolic-link imports are preserved so LM Studio is not left with a broken link.
+Hard-linked weights remain on disk until **all** links are removed, including the LM Studio destination. `sdl prune` removes both the tracked destination and its staging alias. It preserves files whose identity has changed and refuses cleanup after an incomplete source scan or when either model library is unavailable. It also recovers abandoned import transactions and temporary copy aliases. Files already present in LM Studio without a verifiable StudioLink record are left alone.
 
 ```powershell
 # Preview what would be removed
@@ -214,16 +214,17 @@ Default paths are platform-aware; every one can be overridden with an environmen
 | LM Studio models | LM Studio's configured `downloadsFolder` | LM Studio's configured `downloadsFolder` | LM Studio's configured `downloadsFolder` | `STUDIOLINK_LMSTUDIO_MODELS_DIR` |
 | State directory | `~\.studiolink` | `~/.studiolink` | `~/.studiolink` | `STUDIOLINK_STATE_DIR` |
 
+The LM Studio models override must match the models directory selected in LM Studio; it does not change where `lms import` writes files. A mismatch is reported before importing.
+
 ## How It Works
 
 1. **Scanning** - Reads manifest files from the configured Ollama models directory
 2. **Blob Resolution** - Locates GGUF blobs in Ollama's content-addressed blob directory
-3. **Validation** - Verifies blobs start with GGUF magic bytes
-4. **Import Aliases** - Creates digest-keyed, human-readable `.gguf` aliases. Copy mode uses a temporary alias on Ollama's filesystem so the state and LM Studio directories may live on other volumes
-5. **LM Studio Import** - Uses `lms import` CLI to import models
-6. **State Tracking** - Saves sync records and the expected LM Studio target to `~/.studiolink/state.json` (written atomically)
-7. **Reconciliation** - Status and sync verify that the expected LM Studio target still exists instead of trusting state alone
-8. **Pruning** - Pruning is blocked after unavailable or incomplete Ollama scans and preserves aliases required by symbolic imports
+3. **Validation** - Checks SHA-256 digest syntax, GGUF magic bytes, and the blob size declared in the manifest
+4. **Import Aliases** - Creates digest-keyed, human-readable `.gguf` aliases. Copy mode uses a temporary alias on Ollama's filesystem, removed after the import; other modes use `~/.studiolink/imports/`
+5. **LM Studio Import** - Uses `lms import` to stage and verify the requested link/copy, then publishes the destination without overwriting an existing file. Failed imports clean up partial files; subsequent sync or prune recovers abandoned transactions after a process crash
+6. **State Tracking** - Saves destination paths and file identities to `~/.studiolink/state.json` (written atomically), verifies imports before skipping, and repairs missing destinations. Sync and prune operations share a process lock.
+7. **Cleanup** - Successful replacement imports remove the previous managed destination and alias. `sdl prune` removes obsolete tracked imports and orphaned aliases; its dry run counts shared file data once.
 
 ## Troubleshooting
 
@@ -234,16 +235,16 @@ ollama pull <model-name>
 ```
 
 ### Hard link fails (cross-volume)
-Hard-link imports require the Ollama blob store, StudioLink alias directory, and LM Studio models directory to live on the same filesystem/volume. If they do not, retry with copy mode; copy mode creates its temporary naming alias on Ollama's filesystem and can copy to LM Studio on another volume:
+Hard links require the Ollama blob store, the StudioLink state directory, and the LM Studio models directory to live on the same filesystem/volume. If they don't, the sync reports a hard-link error; retry with copy mode instead:
 
 ```powershell
 sdl sync <model-name> --copy
 ```
 
-The StudioLink state directory does not need to share Ollama's volume when using copy mode.
+Copy mode creates its temporary naming alias on Ollama's filesystem, so the state directory and LM Studio library may live on other volumes without requiring symbolic-link permission. Symbolic-link mode uses a symlink for cross-volume staging and requires permission to create symlinks on Windows.
 
 ### Deleted a model in Ollama but disk space wasn't freed
-Run `sdl prune` to remove aliases that are no longer needed. If LM Studio imported the model with `--hard-link`, its final hard link intentionally continues to retain the data; removing only the staging alias cannot free those bytes. Symbolic-link aliases are preserved while LM Studio depends on them.
+Both LM Studio imports and StudioLink staging aliases can keep a deleted Ollama blob alive. Run `sdl prune --dry-run` to preview cleanup, then `sdl prune` to remove the obsolete managed files. Untracked LM Studio files may still hold links and need separate inspection.
 
 ### LM Studio import fails
 Run `sdl doctor` to verify:
@@ -256,8 +257,10 @@ Run `sdl doctor` to verify:
 - **Ollama as source of truth** - StudioLink never changes Ollama manifests or content-addressed blobs; copy mode may briefly create a `.studiolink-imports` alias directory on the same filesystem
 - **Hard links by default** - Space-efficient, creates references rather than copies
 - **No silent fallbacks** - If a hard link is impossible (cross-volume), the sync fails loudly; use `--copy` explicitly
-- **State persistence** - Tracks imports to avoid redundant operations; state is written atomically and corrupt records are skipped, never crash
-- **Safe pruning** - Orphaned aliases are cleaned up only after a complete source scan; symbolic-link dependencies are retained
+- **State persistence** - Tracks and verifies actual imports to avoid redundant operations; state is written atomically and corrupt records are skipped. Verified existing files can restore lost state.
+- **Copy deduplication** - Tags with identical weights share one destination copy through hard links when the destination filesystem supports them.
+- **Dry runs** - Preview sync actions without replacing aliases or invoking an import.
+- **Prune over leak** - Obsolete tracked destinations and orphaned aliases are cleaned up with `sdl prune` instead of pinning disk space forever
 - **CLI-only** - No GUI, designed for automation and scripting
 
 ## License
