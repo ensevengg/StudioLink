@@ -124,3 +124,23 @@ def test_copy_publication_works_without_filesystem_hardlinks(tmp_path, monkeypat
     publish_import(staged, target)
     assert target.read_bytes() == b"GGUFnew"
     assert not staged.exists()
+
+
+def test_prune_reports_and_removes_abandoned_partial_import(library):
+    import json
+
+    from studiolink.transactions import TRANSACTIONS
+
+    config, service, _, _, _ = library
+    work = config.lmstudio_models_dir / TRANSACTIONS / "import-interrupted"
+    work.mkdir(parents=True)
+    target = work / "model.gguf"
+    target.write_bytes(b"GGUFpartial")
+    (work / "owner.json").write_text(json.dumps({"filename": target.name}))
+    report = service.prune(dry_run=True)
+    assert target.exists()
+    assert len(report.imports) == 1
+    assert report.imports[0].would_free and not report.imports[0].removed
+    report = service.prune()
+    assert not target.exists()
+    assert report.imports[0].removed and report.imports[0].size == 11

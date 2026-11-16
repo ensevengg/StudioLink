@@ -249,26 +249,33 @@ def run_doctor(args: argparse.Namespace, service: StudioLinkService) -> int:
 
 def run_prune(args: argparse.Namespace, service: StudioLinkService) -> int:
     report = service.prune(dry_run=bool(args.dry_run))
+    files = (*report.imports, *report.aliases)
+    failed = not report.dry_run and any(not item.removed for item in files)
     if args.json:
         print(json.dumps(report.to_json(), indent=2))
-        return 0
+        return 1 if failed else 0
 
     verb = "Would remove" if report.dry_run else "Removed"
-    if not report.aliases and not report.records_removed:
+    if not files and not report.records_removed:
         print("Nothing to prune.")
         return 0
-    for item in report.aliases:
-        print(f"- {verb} alias: {item.path} ({item.size} bytes) - {item.reason}")
+    for item in files:
+        action = verb if report.dry_run or item.removed else "Failed to remove"
+        print(f"- {action}: {item.path} ({item.size} bytes) - {item.reason}")
     if report.records_removed:
         print(
             f"- {verb} {len(report.records_removed)} stale sync record(s): "
             + ", ".join(report.records_removed)
         )
-    would_free = sum(item.size for item in report.aliases if item.would_free)
+    would_free = sum(
+        item.size
+        for item in files
+        if item.would_free and (report.dry_run or item.removed)
+    )
     if would_free:
         action = "would free" if report.dry_run else "freed"
-        print(f"~{would_free} bytes {action} (aliases that were the last link).")
-    return 0
+        print(f"~{would_free} bytes {action} (files that were the last link).")
+    return 1 if failed else 0
 
 
 def run_upgrade(args: argparse.Namespace, service: StudioLinkService) -> int:

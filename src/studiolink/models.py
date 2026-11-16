@@ -241,10 +241,12 @@ class PruneReport:
     dry_run: bool
     aliases: tuple[PruneResult, ...] = ()
     records_removed: tuple[str, ...] = ()
+    imports: tuple[PruneResult, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
             "dry_run": self.dry_run,
             "aliases": [item.to_json() for item in self.aliases],
+            "imports": [item.to_json() for item in self.imports],
             "records_removed": list(self.records_removed),
         }

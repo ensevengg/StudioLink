@@ -19,6 +19,7 @@ from studiolink.state import StateStore
 
 
 def build_service(config, lmstudio):
+    config.lmstudio_models_dir.mkdir(parents=True, exist_ok=True)
     return StudioLinkService(
         config=config, ollama=OllamaAdapter(config), lmstudio=lmstudio
     )
@@ -285,6 +286,7 @@ class TestPrune:
     ):
         config = make_config()
         config.ollama_manifests_dir.mkdir(parents=True)
+        config.ollama_blobs_dir.mkdir(parents=True)
         service = build_service(config, fake_lmstudio)
         store = StateStore(config.state_file)
         store.upsert(make_sync_record("removed:model", DIGEST_A))

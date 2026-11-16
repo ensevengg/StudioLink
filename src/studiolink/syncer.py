@@ -17,7 +17,9 @@ from studiolink.files import (
     identity,
     owns_destination,
     record_destination,
+    remove_import,
     same_file,
+    symlink_references,
 )
 from studiolink.lmstudio_adapter import LMStudioError
 from studiolink.models import (
@@ -242,6 +244,33 @@ class Syncer:
                         f"LM Studio did not create the expected {link_mode} import at {target}; "
                         "check that STUDIOLINK_LMSTUDIO_MODELS_DIR matches LM Studio's models directory"
                     )
+            if existing is not None:
+                keep = {target, alias_path}
+                for name, record in records.items():
+                    if name != model.canonical_name:
+                        keep.add(record.import_alias_path)
+                        keep.add(
+                            record_destination(record, self.config.lmstudio_models_dir)
+                        )
+                old_target = record_destination(
+                    existing, self.config.lmstudio_models_dir
+                )
+                if old_target != target:
+                    remove_import(
+                        existing,
+                        self.config.lmstudio_models_dir,
+                        self.config.import_staging_dir,
+                        keep=keep,
+                    )
+                elif (
+                    existing.import_alias_path not in keep
+                    and existing.import_alias_path.parent.resolve()
+                    == self.config.import_staging_dir.resolve()
+                ):
+                    if existing.import_alias_path.absolute() not in symlink_references(
+                        self.config.lmstudio_models_dir
+                    ):
+                        existing.import_alias_path.unlink(missing_ok=True)
             success = True
         except (
             LMStudioError,

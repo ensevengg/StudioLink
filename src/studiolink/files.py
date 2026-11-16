@@ -100,3 +100,35 @@ def healthy_destination(
         return equal_contents(path, blob)
     except OSError:
         return False
+
+
+def remove_import(
+    record: SyncRecord, root: Path, staging: Path, *, keep: set[Path]
+) -> None:
+    path = record_destination(record, root)
+    if path not in keep and (path.exists() or path.is_symlink()):
+        if not owns_destination(record, path):
+            raise RuntimeError(
+                f"Refusing to remove a changed or unverified import: {path}"
+            )
+        path.unlink()
+    alias = record.import_alias_path
+    if alias.parent.resolve() == staging.resolve() and alias not in keep:
+        if alias.absolute() not in symlink_references(root):
+            alias.unlink(missing_ok=True)
+
+
+def symlink_references(root: Path) -> dict[Path, set[Path]]:
+    """Find LM Studio symlinks before deleting aliases, including untracked ones."""
+    references: dict[Path, set[Path]] = {}
+
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    for directory, dirs, files in os.walk(root, onerror=fail):
+        for name in (*dirs, *files):
+            path = Path(directory) / name
+            if path.is_symlink():
+                target = Path(os.path.abspath(path.parent / os.readlink(path)))
+                references.setdefault(target, set()).add(path)
+    return references

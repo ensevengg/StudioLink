@@ -16,6 +16,17 @@ from studiolink.models import LinkMode
 from studiolink.state import StateStore
 
 
+def test_prune_preserves_untracked_symlink_after_lost_state(library):
+    config, service, _, manifest, blob = library
+    service.sync(sync_all=True, link_mode=LinkMode.SYMBOLIC_LINK)
+    target = destination(config, service.scan()[0])
+    config.state_file.unlink()
+    manifest.unlink()
+    blob.unlink()
+    service.prune()
+    assert target.is_file(), "prune broke an untracked LM Studio import"
+
+
 def test_state_write_failure_can_recover_existing_copy(library, monkeypatch):
     config, service, adapter, _, blob = library
 
@@ -116,3 +127,77 @@ def test_real_cross_filesystem_import(make_config, fake_lmstudio, tmp_path, mode
             assert (
                 destination(config, service.scan()[0]).read_bytes() == blob.read_bytes()
             )
+
+
+def test_failed_prune_can_be_retried_without_losing_record(library, monkeypatch):
+    config, service, _, manifest, blob = library
+    service.sync(sync_all=True)
+    target = destination(config, service.scan()[0])
+    alias = config.import_staging_dir / service.scan()[0].import_filename
+    manifest.unlink()
+    blob.unlink()
+    original = Path.unlink
+
+    def denied(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError("busy destination")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", denied)
+        report = service.prune()
+        assert not report.imports[0].removed
+    assert service.state.get_all_records()
+    assert alias.is_file() and target.is_file()
+    service.prune()
+    assert not service.state.get_all_records()
+    assert not target.exists() and not alias.exists()
+
+
+def test_unavailable_lmstudio_directory_preserves_aliases_and_state(library):
+    config, service, _, manifest, blob = library
+    service.sync(sync_all=True)
+    alias = config.import_staging_dir / service.scan()[0].import_filename
+    manifest.unlink()
+    blob.unlink()
+    config.lmstudio_models_dir.rename(config.lmstudio_models_dir.with_name("unmounted"))
+    before = config.state_file.read_bytes()
+    with pytest.raises(RuntimeError, match="LM Studio models directory is unavailable"):
+        service.prune()
+    assert alias.is_file()
+    assert config.state_file.read_bytes() == before
+
+
+def test_repull_preserves_untracked_symbolic_dependency(library):
+    from conftest import DIGEST_B
+
+    config, service, _, _, _ = library
+    service.sync(sync_all=True, link_mode=LinkMode.SYMBOLIC_LINK)
+    alias = config.import_staging_dir / service.scan()[0].import_filename
+    manual = config.lmstudio_models_dir / "manual" / "model" / "saved.gguf"
+    manual.parent.mkdir(parents=True)
+    manual.symlink_to(alias)
+    original = manual.read_bytes()
+    write_manifest(config, digest=DIGEST_B)
+    write_blob(config, DIGEST_B)
+    assert (
+        service.sync(sync_all=True, link_mode=LinkMode.SYMBOLIC_LINK)[0].status
+        == "synced"
+    )
+    assert manual.read_bytes() == original
+
+
+def test_prune_cleans_abandoned_copy_staging(library):
+    config, service, _, _, blob = library
+    model = service.scan()[0]
+    staging = config.ollama_models_dir / ".studiolink-imports"
+    staging.mkdir()
+    alias = staging / model.import_filename
+    os.link(blob, alias)
+    config.lmstudio_models_dir.mkdir(parents=True)
+    report = service.prune(dry_run=True)
+    assert alias.exists()
+    assert alias in {item.path for item in report.aliases}
+    service.prune()
+    assert not alias.exists()
+    assert blob.stat().st_nlink == 1

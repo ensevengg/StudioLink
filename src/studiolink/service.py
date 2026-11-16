@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from studiolink.config import StudioLinkConfig
+from studiolink.files import owns_destination, record_destination, symlink_references
 from studiolink.lmstudio_adapter import LMStudioAdapter
 from studiolink.models import (
     DoctorCheck,
@@ -23,6 +24,7 @@ from studiolink.models import (
 from studiolink.ollama_adapter import OllamaAdapter
 from studiolink.state import StateStore
 from studiolink.syncer import Syncer, same_file
+from studiolink.transactions import recover_imports
 
 if TYPE_CHECKING:
     from studiolink.ports import LMStudioPort, OllamaPort
@@ -120,105 +122,166 @@ class StudioLinkService:
         return syncer.sync(selected, mode, import_mode, dry_run)
 
     def prune(self, *, dry_run: bool = False) -> PruneReport:
+        """Remove obsolete managed destinations as well as their staging aliases."""
         with self.state.lock():
             return self._prune_locked(dry_run=dry_run)
 
-    def _prune_locked(self, *, dry_run: bool = False) -> PruneReport:
-        """Safely remove unneeded aliases and stale sync records.
-
-        Destructive work requires a complete Ollama scan, and aliases needed
-        by symbolic LM Studio imports are preserved.
-        """
+    def _prune_locked(self, *, dry_run: bool) -> PruneReport:
         scan = self.scan_report()
-        if not scan.source_available:
-            details = "; ".join(scan.errors) or "source is unavailable"
+        if not scan.source_available or not self.config.ollama_blobs_dir.is_dir():
+            details = "; ".join(scan.errors) or "blobs directory is unavailable"
             raise RuntimeError(f"Ollama library could not be scanned: {details}")
         if not scan.complete:
             details = "; ".join(scan.errors) or "unknown scan error"
             raise RuntimeError(f"Ollama manifest scan was incomplete: {details}")
-
+        if not self.config.lmstudio_models_dir.is_dir():
+            raise RuntimeError(
+                "LM Studio models directory is unavailable; refusing to prune"
+            )
         models = list(scan.models)
-        expected: dict[str, OllamaModel] = {
-            model.import_filename: model
-            for model in models
-            if model.readiness is ModelReadiness.READY and model.blob_path is not None
-        }
+        current = {m.canonical_name: m for m in models}
         records = self.state.get_all_records()
-        unready_names = {
-            model.canonical_name
-            for model in models
-            if model.readiness is not ModelReadiness.READY
+        stale = {
+            name: record
+            for name, record in records.items()
+            if name not in current
+            or (
+                current[name].readiness is ModelReadiness.READY
+                and record.digest != current[name].model_digest
+            )
         }
         protected_aliases = {
             record.import_alias_path
             for name, record in records.items()
-            if record.link_mode is LinkMode.SYMBOLIC_LINK or name in unready_names
+            if name not in stale
         }
-
-        alias_results: list[PruneResult] = []
-        staging = self.config.import_staging_dir
-        if staging.exists():
-            for path in sorted(staging.iterdir()):
-                if not path.is_file():
-                    continue
-                if path in protected_aliases:
-                    logger.debug("Preserving required import alias: %s", path)
-                    continue
-                model = expected.get(path.name)
-                if model is not None and same_file(path, model.blob_path or path):
-                    continue
-                reason = (
-                    "alias no longer points at the current model blob"
-                    if model is not None
-                    else "model no longer present in Ollama (or was re-pulled)"
-                )
-                try:
-                    stat = path.stat()
-                except OSError as exc:
-                    logger.warning("Could not inspect alias %s: %s", path, exc)
-                    continue
-                removed = False
-                if not dry_run:
-                    try:
-                        path.unlink()
-                        removed = True
-                    except OSError as exc:
-                        logger.warning("Could not remove alias %s: %s", path, exc)
-                alias_results.append(
-                    PruneResult(
-                        path=path,
-                        size=stat.st_size,
-                        would_free=stat.st_nlink == 1,
-                        reason=reason,
-                        removed=removed,
-                    )
-                )
-
-        known = {model.canonical_name for model in models}
-        stale_names = sorted(
-            name
+        protected_targets = {
+            record_destination(record, self.config.lmstudio_models_dir)
             for name, record in records.items()
-            if name not in known and record.link_mode is not LinkMode.SYMBOLIC_LINK
-        )
-        if stale_names and not dry_run:
-            remaining = {
-                name: record
-                for name, record in records.items()
-                if name not in stale_names
-            }
-            self.state.save(remaining)
-        records_removed = tuple(stale_names)
+            if name not in stale
+        }
+        recovered = recover_imports(self.config.lmstudio_models_dir, dry_run=dry_run)
+        references = symlink_references(self.config.lmstudio_models_dir)
+        expected = {m.import_filename: m for m in models}
+        imports: list[PruneResult] = list(recovered)
+        aliases: list[PruneResult] = []
+        removed_names: list[str] = []
+        seen: set = set()
+        # Simulate link-count changes in dry runs as well, so an inode shared by
+        # several doomed paths is counted exactly once.
+        removed_links: dict[tuple[int, int], int] = {}
 
-        logger.debug(
-            "Prune complete: %d alias(es), %d record(s) (dry_run=%s)",
-            len(alias_results),
-            len(records_removed),
-            dry_run,
-        )
+        def remove(path, reason, results):
+            if results is aliases and any(
+                ref.is_symlink()
+                for ref in references.get(path.absolute(), ())
+                if ref not in seen
+            ):
+                return False
+            if path in seen:
+                return True
+            try:
+                stat = path.lstat()
+            except FileNotFoundError:
+                return True
+            is_link = path.is_symlink()
+            key = (stat.st_dev, stat.st_ino)
+            remaining = stat.st_nlink - (removed_links.get(key, 0) if dry_run else 0)
+            removed = False
+            error = None
+            if not dry_run:
+                try:
+                    path.unlink()
+                    removed = True
+                except OSError as exc:
+                    error = exc
+                    logger.warning("Could not remove %s: %s", path, exc)
+            if dry_run or removed:
+                removed_links[key] = removed_links.get(key, 0) + 1
+                seen.add(path)
+            results.append(
+                PruneResult(
+                    path=path,
+                    size=stat.st_size,
+                    would_free=not is_link and remaining == 1,
+                    reason=reason if error is None else str(error),
+                    removed=removed,
+                )
+            )
+            return dry_run or removed
+
+        for name, record in stale.items():
+            target = record_destination(record, self.config.lmstudio_models_dir)
+            if (
+                record.link_mode is LinkMode.SYMBOLIC_LINK
+                and record.imported_model_path is None
+            ):
+                # A legacy record does not identify which symlink depends on this alias.
+                protected_aliases.add(record.import_alias_path)
+                continue
+            if target not in protected_targets and (
+                target.exists() or target.is_symlink()
+            ):
+                if not owns_destination(record, target):
+                    logger.warning("Keeping changed or unverified import: %s", target)
+                    protected_aliases.add(record.import_alias_path)
+                    continue
+                if not remove(
+                    target, "model removed from Ollama or superseded", imports
+                ):
+                    protected_aliases.add(record.import_alias_path)
+                    continue
+            alias = record.import_alias_path
+            if (
+                alias not in protected_aliases
+                and alias.parent.resolve() == self.config.import_staging_dir.resolve()
+            ):
+                if not remove(alias, "obsolete import alias", aliases):
+                    continue
+            removed_names.append(name)
+
+        for staging in (
+            self.config.import_staging_dir,
+            self.config.ollama_models_dir / ".studiolink-imports",
+        ):
+            if staging.is_dir():
+                for path in sorted(staging.iterdir()):
+                    if (
+                        path in protected_aliases
+                        or path in seen
+                        or not (path.is_file() or path.is_symlink())
+                    ):
+                        continue
+                    model = expected.get(path.name)
+                    # An invalid/incomplete manifest isn't proof its alias is obsolete.
+                    if (
+                        staging == self.config.import_staging_dir
+                        and model is not None
+                        and (
+                            model.readiness is not ModelReadiness.READY
+                            or (
+                                model.blob_path is not None
+                                and same_file(path, model.blob_path)
+                            )
+                        )
+                    ):
+                        continue
+                    reason = (
+                        "alias no longer points at the current model blob"
+                        if model
+                        else "model no longer present in Ollama (or was re-pulled)"
+                    )
+                    remove(path, reason, aliases)
+
+        if not dry_run and removed_names:
+            for name in removed_names:
+                records.pop(name)
+            self.state.save(records)
         return PruneReport(
             dry_run=dry_run,
-            aliases=tuple(alias_results),
-            records_removed=records_removed,
+            aliases=tuple(aliases),
+            imports=tuple(imports),
+            records_removed=tuple(sorted(removed_names)),
         )
 
     def doctor(self) -> list[DoctorCheck]:
