@@ -77,7 +77,11 @@ class StudioLinkService:
         return [
             StatusEntry(
                 model=model,
-                synced=self._record_is_synced(model, records.get(model.canonical_name)),
+                synced=is_synced(
+                    model,
+                    records.get(model.canonical_name),
+                    self.config.lmstudio_models_dir,
+                ),
                 sync_record=records.get(model.canonical_name),
             )
             for model in models
@@ -350,16 +354,6 @@ class StudioLinkService:
             f"{label}: device {device}" for label, device in devices.items()
         )
         return DoctorCheck("hard-link volume compatibility", ok, details)
-
-    def _record_is_synced(self, model: OllamaModel, record: SyncRecord | None) -> bool:
-        expected_target = None
-        if record is not None and record.imported_model_path is None:
-            expected_target = (
-                self.config.lmstudio_models_dir
-                / record.user_repo
-                / record.import_alias_path.name
-            )
-        return is_synced(model, record, expected_target=expected_target)
 
     def _select_models(
         self, discovered: list[OllamaModel], requested_names: list[str]

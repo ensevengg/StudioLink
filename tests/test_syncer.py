@@ -154,11 +154,11 @@ class TestDryRun:
         results = syncer.sync([model], **sync_kwargs(dry_run=True))
 
         assert results[0].status == "dry-run"
-        assert fake.calls[0]["dry_run"] is True
+        assert fake.calls == []
         assert not (config.import_staging_dir / model.import_filename).exists()
         assert StateStore(config.state_file).get_all_records() == {}
 
-    def test_dry_run_failure_still_cleans_alias(self, make_syncer):
+    def test_dry_run_does_not_need_working_lms(self, make_syncer):
         syncer, config, fake = make_syncer()
         write_manifest(config, digest=DIGEST_A)
         write_blob(config, DIGEST_A)
@@ -167,7 +167,7 @@ class TestDryRun:
 
         results = syncer.sync([model], **sync_kwargs(dry_run=True))
 
-        assert results[0].status == "error"
+        assert results[0].status == "dry-run"
         assert not (config.import_staging_dir / model.import_filename).exists()
 
 
@@ -326,3 +326,22 @@ class TestReadinessOfSyncedModels:
         results = syncer.sync([model], **sync_kwargs())
         assert results[0].model is model
         assert results[0].model.readiness is ModelReadiness.READY
+
+
+def test_failed_alias_replacement_preserves_previous_link(make_syncer, monkeypatch):
+    syncer, config, _ = make_syncer()
+    write_manifest(config)
+    blob = write_blob(config, DIGEST_A)
+    model = scan_models(config)[0]
+    alias, _ = _ensure_import_alias(model, config.import_staging_dir)
+    old_inode = alias.stat().st_ino
+    blob.unlink()
+    write_blob(config, DIGEST_A)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "link", denied)
+    result = syncer.sync(scan_models(config), **sync_kwargs())
+    assert result[0].status == "error"
+    assert alias.stat().st_ino == old_inode

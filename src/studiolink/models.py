@@ -166,16 +166,30 @@ class SyncRecord:
 
 
 def is_synced(
-    model: OllamaModel,
-    record: SyncRecord | None,
-    *,
-    expected_target: Path | None = None,
+    model: OllamaModel, record: SyncRecord | None, models_dir: Path | None = None
 ) -> bool:
-    """Check if state and the imported LM Studio file match the model."""
-    if record is None or record.digest != model.model_digest:
+    """A saved digest is insufficient: the imported file must still work."""
+    from studiolink.files import healthy_destination, record_destination
+
+    if (
+        record is None
+        or record.digest != model.model_digest
+        or model.readiness is not ModelReadiness.READY
+        or model.blob_path is None
+        or not model.blob_present
+    ):
         return False
-    target = record.imported_model_path or expected_target
-    return target.is_file() if target is not None else True
+    try:
+        target = (
+            record_destination(record, models_dir)
+            if models_dir
+            else record.imported_model_path
+        )
+        return target is not None and healthy_destination(
+            target, model.blob_path, record.link_mode, record
+        )
+    except (OSError, ValueError):
+        return False
 
 
 @dataclass(slots=True, frozen=True)

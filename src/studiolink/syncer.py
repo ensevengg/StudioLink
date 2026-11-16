@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from studiolink.config import StudioLinkConfig
+from studiolink.files import (
+    destination_path,
+    healthy_destination,
+    identity,
+    owns_destination,
+    record_destination,
+    same_file,
+)
 from studiolink.lmstudio_adapter import LMStudioError
 from studiolink.models import (
     ImportMode,
@@ -20,21 +32,9 @@ from studiolink.models import (
 )
 from studiolink.ports import LMStudioPort
 from studiolink.state import StateStore
-from studiolink.transactions import recover_imports
+from studiolink.transactions import import_transaction, recover_imports
 
 logger = logging.getLogger("studiolink")
-
-
-def same_file(left: Path, right: Path) -> bool:
-    """Check whether two paths reference the same inode (hard link)."""
-    try:
-        left_stat, right_stat = left.stat(), right.stat()
-    except OSError:
-        return False
-    return (left_stat.st_dev, left_stat.st_ino) == (
-        right_stat.st_dev,
-        right_stat.st_ino,
-    )
 
 
 class Syncer:
@@ -78,9 +78,16 @@ class Syncer:
         logger.debug("Loaded %d existing sync record(s)", len(records))
         results: list[SyncResult] = []
         for model in models:
-            result = self._sync_one(model, records, link_mode, import_mode, dry_run)
+            try:
+                result = self._sync_one(model, records, link_mode, import_mode, dry_run)
+            except (OSError, RuntimeError, ValueError) as exc:
+                result = SyncResult(model=model, status="error", message=str(exc))
             results.append(result)
-            if result.record and not dry_run:
+            if (
+                result.record
+                and not dry_run
+                and result.record != records.get(model.canonical_name)
+            ):
                 records[result.record.canonical_name] = result.record
                 self.state.save(records)
                 logger.debug("Saved sync record for %s", model.canonical_name)
@@ -100,20 +107,25 @@ class Syncer:
             model.readiness,
         )
         existing = records.get(model.canonical_name)
-        expected_target = None
-        if existing is not None and existing.imported_model_path is None:
-            expected_target = (
-                self.config.lmstudio_models_dir
-                / existing.user_repo
-                / existing.import_alias_path.name
-            )
-        if is_synced(model, existing, expected_target=expected_target):
+        if (
+            existing is not None
+            and is_synced(model, existing, self.config.lmstudio_models_dir)
+            and existing.link_mode is link_mode
+        ):
             logger.debug("Model %s is already synced, skipping", model.canonical_name)
+            verified_target = record_destination(
+                existing, self.config.lmstudio_models_dir
+            )
             return SyncResult(
                 model=model,
                 status="skipped",
-                message="already synced according to StudioLink state",
-                record=existing,
+                message="imported file verified; already synced",
+                record=replace(
+                    existing,
+                    imported_model_path=verified_target,
+                    imported_identity=identity(verified_target),
+                    blob_path=model.blob_path,
+                ),
             )
         if model.readiness is ModelReadiness.STALE:
             logger.debug("Model %s is stale (blob missing)", model.canonical_name)
@@ -137,6 +149,20 @@ class Syncer:
                 message="model is not ready for import: "
                 + "; ".join(model.issues or ("unknown error",)),
             )
+        if dry_run:
+            source = (
+                model.blob_path
+                if import_mode is ImportMode.DIRECT
+                else self.config.import_staging_dir / model.import_filename
+            )
+            target = destination_path(
+                self.config.lmstudio_models_dir, model.user_repo, source.name
+            )
+            return SyncResult(
+                model=model,
+                status="dry-run",
+                message=f"Would sync using {link_mode}: {target}",
+            )
         if import_mode is ImportMode.DIRECT:
             alias_path = model.blob_path
             alias_created = False
@@ -158,45 +184,86 @@ class Syncer:
                     message=str(exc),
                 )
 
-        import_error: Exception | None = None
-        import_result: ImportResult | None = None
+        target = destination_path(
+            self.config.lmstudio_models_dir, model.user_repo, alias_path.name
+        )
+        import_result = ImportResult(
+            command=(), stdout="existing import verified", stderr="", return_code=0
+        )
+        target_record = (
+            existing
+            if existing
+            and existing.digest == model.model_digest
+            and existing.link_mode is link_mode
+            and record_destination(existing, self.config.lmstudio_models_dir) == target
+            else None
+        )
+        success = False
         try:
-            import_result = self.lmstudio.import_model(
-                str(alias_path),
-                user_repo=model.user_repo,
-                link_mode=link_mode,
-                dry_run=dry_run,
-            )
-            logger.debug("LM Studio import completed: %s", import_result.return_code)
-        except (LMStudioError, subprocess.TimeoutExpired) as exc:
-            # One failing model must not abort the rest of the batch.
-            logger.debug("LM Studio import failed: %s", exc)
-            import_error = exc
-        finally:
-            should_remove_alias = dry_run or link_mode is LinkMode.COPY
-            if (
-                should_remove_alias
-                and (alias_created or link_mode is LinkMode.COPY)
-                and alias_path.exists()
-                and import_mode is not ImportMode.DIRECT
+            if not healthy_destination(
+                target, model.blob_path, link_mode, target_record
             ):
-                logger.debug("Cleaning up temporary import alias: %s", alias_path)
-                try:
-                    alias_path.unlink()
-                    alias_path.parent.rmdir()
-                except OSError as exc:
-                    logger.warning(
-                        "Could not clean up import alias %s: %s", alias_path, exc
+                if target.exists() or target.is_symlink():
+                    managed = existing is not None and (
+                        record_destination(existing, self.config.lmstudio_models_dir)
+                        == target
+                        and owns_destination(existing, target)
                     )
-
-        if import_error is not None:
-            return SyncResult(model=model, status="error", message=str(import_error))
-        if import_result is None:
-            return SyncResult(
-                model=model,
-                status="error",
-                message="LM Studio import returned no result",
-            )
+                    # Lost state can be rebuilt from a verified import even
+                    # when the requested mode differs from its current mode.
+                    recoverable = existing is None and any(
+                        healthy_destination(target, model.blob_path, candidate)
+                        for candidate in LinkMode
+                    )
+                    if not (managed or recoverable):
+                        raise RuntimeError(
+                            f"Import destination already exists and is not verified: {target}"
+                        )
+                    # Build beside the destination and replace atomically. A
+                    # failed conversion leaves the old import usable.
+                    self._replace_destination(
+                        alias_path, target, link_mode, model, records
+                    )
+                    import_result = ImportResult(
+                        command=(),
+                        stdout=f"Replaced managed import: {target}",
+                        stderr="",
+                        return_code=0,
+                    )
+                else:
+                    import_result = self.lmstudio.import_model(
+                        str(alias_path.absolute()),
+                        user_repo=model.user_repo,
+                        link_mode=link_mode,
+                        dry_run=False,
+                    )
+                if not healthy_destination(target, model.blob_path, link_mode):
+                    raise RuntimeError(
+                        f"LM Studio did not create the expected {link_mode} import at {target}; "
+                        "check that STUDIOLINK_LMSTUDIO_MODELS_DIR matches LM Studio's models directory"
+                    )
+            success = True
+        except (
+            LMStudioError,
+            subprocess.TimeoutExpired,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            return SyncResult(model=model, status="error", message=str(exc))
+        finally:
+            if import_mode is not ImportMode.DIRECT and (
+                (alias_created and not success) or link_mode is LinkMode.COPY
+            ):
+                # Preserve a symlink target if import succeeded but a later cleanup
+                # failed. A subsequent sync can adopt that verified destination.
+                if not (target.is_symlink() and same_file(target, alias_path)):
+                    alias_path.unlink(missing_ok=True)
+                    if link_mode is LinkMode.COPY:
+                        try:
+                            alias_path.parent.rmdir()
+                        except OSError:
+                            pass
 
         record = SyncRecord(
             canonical_name=model.canonical_name,
@@ -206,49 +273,81 @@ class Syncer:
             user_repo=model.user_repo,
             link_mode=link_mode,
             imported_at=datetime.now(tz=timezone.utc),
-            imported_model_path=(
-                self.config.lmstudio_models_dir / model.user_repo / alias_path.name
-            ),
             import_command=import_result.command,
+            imported_model_path=target,
+            imported_identity=identity(target),
         )
         return SyncResult(
             model=model,
-            status="dry-run" if dry_run else "synced",
+            status="synced",
             message=_format_import_message(import_result),
             record=record,
         )
 
+    def _replace_destination(
+        self,
+        source: Path,
+        target: Path,
+        mode: LinkMode,
+        model: OllamaModel,
+        records: dict[str, SyncRecord],
+    ) -> None:
+        with import_transaction(
+            self.config.lmstudio_models_dir, target.name
+        ) as temporary:
+            if mode is LinkMode.HARD_LINK:
+                os.link(source.resolve(), temporary)
+            elif mode is LinkMode.SYMBOLIC_LINK:
+                temporary.symlink_to(source.absolute())
+            else:
+                shutil.copyfile(source, temporary)
+            os.replace(temporary, target)
+
     def _ensure_import_alias(
         self, model: OllamaModel, link_mode: LinkMode
     ) -> tuple[Path, bool]:
-        staging_dir = self.config.import_staging_dir
+        staging = self.config.import_staging_dir
         if link_mode is LinkMode.COPY:
-            # The alias controls the human-readable LM Studio filename. Keep
-            # this temporary hard link on the Ollama filesystem so copy mode
-            # still works when StudioLink state lives on another volume.
-            staging_dir = self.config.ollama_models_dir / ".studiolink-imports"
-        return _ensure_import_alias(model, staging_dir)
+            staging = self.config.ollama_models_dir / ".studiolink-imports"
+        return _ensure_import_alias(model, staging, link_mode)
 
 
-def _ensure_import_alias(model: OllamaModel, staging_dir: Path) -> tuple[Path, bool]:
+def _ensure_import_alias(
+    model: OllamaModel, staging_dir: Path, link_mode: LinkMode = LinkMode.HARD_LINK
+) -> tuple[Path, bool]:
     alias_path = staging_dir / model.import_filename
     if model.blob_path is None:
         raise RuntimeError(f"No blob path for model {model.canonical_name}")
-    if alias_path.exists():
-        if same_file(alias_path, model.blob_path):
-            logger.debug("Import alias already exists: %s", alias_path)
-            return alias_path, False
-        # The alias survived a re-pull but now points at the old blob content;
-        # replace it so we never import stale weights.
-        logger.debug("Replacing stale import alias: %s", alias_path)
-        alias_path.unlink()
+    present = alias_path.exists() or alias_path.is_symlink()
+    if (
+        present
+        and same_file(alias_path, model.blob_path)
+        and (link_mode is not LinkMode.HARD_LINK or not alias_path.is_symlink())
+    ):
+        return alias_path, False
     staging_dir.mkdir(parents=True, exist_ok=True)
+    temporary = alias_path
+    if present:
+        fd, name = tempfile.mkstemp(prefix=".studiolink-", dir=staging_dir)
+        os.close(fd)
+        temporary = Path(name)
+        temporary.unlink()
     try:
-        os.link(model.blob_path, alias_path)
-        logger.debug("Created hard link: %s -> %s", alias_path, model.blob_path)
+        try:
+            os.link(model.blob_path, temporary)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV or link_mode is LinkMode.HARD_LINK:
+                raise
+            # Stage across volumes without writing another full copy.
+            temporary.symlink_to(model.blob_path.resolve())
+        if present:
+            os.replace(temporary, alias_path)
         return alias_path, True
     except OSError as exc:
-        raise RuntimeError(f"Failed to create import alias (hard link): {exc}") from exc
+        raise RuntimeError(f"Failed to create import alias: {exc}") from exc
+    finally:
+        if temporary != alias_path:
+            temporary.unlink(missing_ok=True)
 
 
 def _format_import_message(result: ImportResult) -> str:

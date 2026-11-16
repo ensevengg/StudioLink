@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -157,7 +159,6 @@ class FakeLMStudio:
         self.calls: list[dict] = []
         self.fail_for: set[str] = set()
         self.timeout_for: set[str] = set()
-        self.models_dir: Path | None = None
 
     def get_version(self) -> str | None:
         return "0.3.17 (fake)"
@@ -190,10 +191,16 @@ class FakeLMStudio:
             )
         if source_path in self.timeout_for:
             raise subprocess.TimeoutExpired(cmd=["lms"], timeout=3600)
-        if not dry_run and self.models_dir is not None:
-            target = self.models_dir / user_repo / Path(source_path).name
+        config = getattr(self, "config", None)
+        if config is not None and not dry_run:
+            target = config.lmstudio_models_dir / user_repo / Path(source_path).name
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(Path(source_path).read_bytes())
+            if link_mode is LinkMode.HARD_LINK:
+                os.link(source_path, target)
+            elif link_mode is LinkMode.SYMBOLIC_LINK:
+                target.symlink_to(source_path)
+            else:
+                shutil.copyfile(source_path, target)
         return ImportResult(
             command=("lms", "import", source_path),
             stdout="",
@@ -215,7 +222,7 @@ def make_syncer(make_config, fake_lmstudio):
 
     def _make(config: StudioLinkConfig | None = None):
         cfg = config or make_config()
-        fake_lmstudio.models_dir = cfg.lmstudio_models_dir
+        fake_lmstudio.config = cfg
         syncer = Syncer(cfg, fake_lmstudio, StateStore(cfg.state_file))
         return syncer, cfg, fake_lmstudio
 

@@ -1,3 +1,6 @@
+import os
+from dataclasses import replace
+
 from conftest import DIGEST_A, DIGEST_B, make_ollama_model, make_sync_record
 
 from studiolink.models import (
@@ -90,9 +93,14 @@ class TestIsSynced:
     def test_no_record(self):
         assert is_synced(make_ollama_model(), None) is False
 
-    def test_matching_digest(self):
-        model = make_ollama_model("llama3:1b", DIGEST_A)
-        assert is_synced(model, make_sync_record("llama3:1b", DIGEST_A)) is True
+    def test_matching_digest_and_live_destination(self, tmp_path):
+        blob = tmp_path / "blob"
+        blob.write_bytes(b"GGUF00000000")
+        target = tmp_path / "model.gguf"
+        os.link(blob, target)
+        model = make_ollama_model("llama3:1b", DIGEST_A, blob_path=blob)
+        record = replace(make_sync_record(), imported_model_path=target)
+        assert is_synced(model, record) is True
 
     def test_digest_mismatch_triggers_resync(self):
         model = make_ollama_model("llama3:1b", DIGEST_B)

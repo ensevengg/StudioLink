@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,42 @@ def destination_path(root: Path, user_repo: str, filename: str) -> Path:
     if len(parts) != 2 or any(p in ("", ".", "..") or "\\" in p for p in parts):
         raise ValueError(f"Invalid import repository: {user_repo}")
     return root.absolute().joinpath(*parts, Path(filename).name)
+
+
+def record_destination(record: SyncRecord, root: Path) -> Path:
+    path = record.imported_model_path or destination_path(
+        root, record.user_repo, record.import_alias_path.name
+    )
+    # Resolve the parent only: the imported file itself may be a symlink to Ollama.
+    if not path.parent.resolve().is_relative_to(root.resolve()):
+        # LM Studio's library may have moved since the record was saved. Check
+        # its expected location under the new root; never delete the old path.
+        path = destination_path(root, record.user_repo, record.import_alias_path.name)
+    if not path.parent.resolve().is_relative_to(root.resolve()):
+        raise ValueError(
+            f"Import directory resolves outside the configured models directory: {path}"
+        )
+    return path
+
+
+def owns_destination(record: SyncRecord, path: Path) -> bool:
+    from studiolink.models import LinkMode
+
+    try:
+        if record.imported_identity is not None:
+            return identity(path) == record.imported_identity
+        # Legacy records have no file identity. Require evidence before removal.
+        if path.is_symlink():
+            target = path.parent / os.readlink(path)
+            return target.absolute() == record.import_alias_path.absolute()
+        for source in (record.import_alias_path, record.blob_path):
+            if same_file(path, source):
+                return True
+            if record.link_mode is LinkMode.COPY and equal_contents(path, source):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def healthy_destination(

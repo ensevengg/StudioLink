@@ -336,16 +336,8 @@ class TestStatusAndSelection:
         service = build_service(config, fake_lmstudio)
         write_manifest(config, digest=DIGEST_A)
         write_blob(config, DIGEST_A)
-        model = OllamaAdapter(config).scan_models()[0]
-        target = config.lmstudio_models_dir / model.user_repo / model.import_filename
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b"GGUFxxxx")
-        StateStore(config.state_file).upsert(
-            replace(
-                make_sync_record("llama3:1b", DIGEST_A),
-                imported_model_path=target,
-            )
-        )
+        fake_lmstudio.config = config
+        service.sync(sync_all=True)
 
         entries = service.status()
 
@@ -358,7 +350,7 @@ class TestStatusAndSelection:
         config = make_config()
         service = build_service(config, fake_lmstudio)
         write_manifest(config, digest=DIGEST_A)
-        write_blob(config, DIGEST_A)
+        blob = write_blob(config, DIGEST_A)
         record = make_sync_record("llama3:1b", DIGEST_A)
         target = (
             config.lmstudio_models_dir
@@ -366,7 +358,7 @@ class TestStatusAndSelection:
             / record.import_alias_path.name
         )
         target.parent.mkdir(parents=True)
-        target.write_bytes(b"GGUFxxxx")
+        os.link(blob, target)
         StateStore(config.state_file).upsert(record)
 
         entries = service.status()
