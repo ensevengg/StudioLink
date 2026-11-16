@@ -20,6 +20,7 @@ from studiolink.models import (
 )
 from studiolink.ports import LMStudioPort
 from studiolink.state import StateStore
+from studiolink.transactions import recover_imports
 
 logger = logging.getLogger("studiolink")
 
@@ -71,6 +72,8 @@ class Syncer:
         import_mode: ImportMode,
         dry_run: bool,
     ) -> list[SyncResult]:
+        if not dry_run:
+            recover_imports(self.config.lmstudio_models_dir)
         records = self.state.get_all_records()
         logger.debug("Loaded %d existing sync record(s)", len(records))
         results: list[SyncResult] = []

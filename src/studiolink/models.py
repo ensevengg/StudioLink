@@ -107,8 +107,9 @@ class SyncRecord:
     user_repo: str
     link_mode: LinkMode
     imported_at: datetime
-    imported_model_path: Path | None = None
     import_command: tuple[str, ...] = field(default_factory=tuple)
+    imported_model_path: Path | None = None
+    imported_identity: tuple[int, int, int, int] | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -119,12 +120,13 @@ class SyncRecord:
             "user_repo": self.user_repo,
             "link_mode": self.link_mode.value,
             "imported_at": self.imported_at.isoformat(),
-            "imported_model_path": (
-                None
-                if self.imported_model_path is None
-                else str(self.imported_model_path)
-            ),
             "import_command": list(self.import_command),
+            "imported_model_path": str(self.imported_model_path)
+            if self.imported_model_path
+            else None,
+            "imported_identity": list(self.imported_identity)
+            if self.imported_identity
+            else None,
         }
 
     @classmethod
@@ -132,6 +134,21 @@ class SyncRecord:
         import_command = payload.get("import_command", [])
         if not isinstance(import_command, list):
             raise TypeError("import_command must be a list")
+        raw_identity = payload.get("imported_identity")
+        imported_identity = None
+        if raw_identity is not None:
+            if (
+                not isinstance(raw_identity, list)
+                or len(raw_identity) != 4
+                or not all(isinstance(value, int) for value in raw_identity)
+            ):
+                raise TypeError("imported_identity must contain four integers")
+            imported_identity = (
+                raw_identity[0],
+                raw_identity[1],
+                raw_identity[2],
+                raw_identity[3],
+            )
         return cls(
             canonical_name=str(payload["canonical_name"]),
             digest=str(payload["digest"]),
@@ -140,11 +157,10 @@ class SyncRecord:
             user_repo=str(payload["user_repo"]),
             link_mode=LinkMode(str(payload["link_mode"])),
             imported_at=datetime.fromisoformat(str(payload["imported_at"])),
-            imported_model_path=(
-                Path(str(payload["imported_model_path"]))
-                if payload.get("imported_model_path")
-                else None
-            ),
+            imported_model_path=Path(str(payload["imported_model_path"]))
+            if payload.get("imported_model_path")
+            else None,
+            imported_identity=imported_identity,
             import_command=tuple(str(item) for item in import_command),
         )
 

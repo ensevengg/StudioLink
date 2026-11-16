@@ -36,7 +36,7 @@ def _default_lms_exe(home: Path) -> Path:
     return Path(shutil.which("lms") or home / ".lmstudio" / "bin" / "lms")
 
 
-def _default_lmstudio_models_dir(home: Path) -> Path:
+def lmstudio_models_directory(home: Path) -> Path:
     fallback = home / ".lmstudio" / "models"
     settings_path = home / ".lmstudio" / "settings.json"
     try:
@@ -88,7 +88,7 @@ class StudioLinkConfig:
             ollama_blobs_dir=ollama_models_dir / "blobs",
             lmstudio_models_dir=_expand_path(
                 "STUDIOLINK_LMSTUDIO_MODELS_DIR",
-                _default_lmstudio_models_dir(home),
+                lmstudio_models_directory(home),
             ),
             state_dir=state_dir,
             state_file=state_dir / "state.json",
