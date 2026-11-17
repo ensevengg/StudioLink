@@ -20,6 +20,7 @@ from studiolink.state import StateStore
 
 
 def build_service(config, lmstudio):
+    config.lmstudio_models_dir.mkdir(parents=True, exist_ok=True)
     return StudioLinkService(
         config=config, ollama=OllamaAdapter(config), lmstudio=lmstudio
     )
@@ -139,14 +140,14 @@ class TestPrune:
         config.import_staging_dir.mkdir(parents=True)
         alias = config.import_staging_dir / "orphan.gguf"
         alias.write_bytes(b"GGUFxxxx")
-        real_read_text = Path.read_text
+        real_read_bytes = Path.read_bytes
 
-        def flaky_read_text(path, *args, **kwargs):
+        def flaky_read_bytes(path, *args, **kwargs):
             if path == broken:
                 raise OSError("access denied")
-            return real_read_text(path, *args, **kwargs)
+            return real_read_bytes(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", flaky_read_text)
+        monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
 
         with pytest.raises(RuntimeError, match="scan was incomplete"):
             service.prune()
@@ -220,7 +221,7 @@ class TestPrune:
         assert report.aliases == ()
         assert (config.import_staging_dir / model.import_filename).exists()
 
-    def test_keeps_all_healthy_projector_bundle_aliases(
+    def test_keeps_healthy_bundle_aliases_until_bundle_is_removed(
         self, make_config, fake_lmstudio
     ):
         config = make_config()
@@ -255,6 +256,17 @@ class TestPrune:
             (
                 config.import_staging_dir / model.artifact_import_filename(artifact)
             ).exists()
+            for artifact in model.artifacts
+        )
+
+        model.manifest_path.unlink()
+        report = service.prune()
+
+        assert report.records_removed == ("llava:1b",)
+        assert len([item for item in report.imports if item.removed]) == 2
+        assert len([item for item in report.aliases if item.removed]) == 2
+        assert all(
+            artifact.blob_path is not None and artifact.blob_path.stat().st_nlink == 1
             for artifact in model.artifacts
         )
 
@@ -333,6 +345,7 @@ class TestPrune:
     ):
         config = make_config()
         config.ollama_manifests_dir.mkdir(parents=True)
+        config.ollama_blobs_dir.mkdir(parents=True)
         service = build_service(config, fake_lmstudio)
         store = StateStore(config.state_file)
         store.upsert(make_sync_record("removed:model", DIGEST_A))
@@ -384,16 +397,8 @@ class TestStatusAndSelection:
         service = build_service(config, fake_lmstudio)
         write_manifest(config, digest=DIGEST_A)
         write_blob(config, DIGEST_A)
-        model = OllamaAdapter(config).scan_models()[0]
-        target = config.lmstudio_models_dir / model.user_repo / model.import_filename
-        target.parent.mkdir(parents=True)
-        target.write_bytes(b"GGUFxxxx")
-        StateStore(config.state_file).upsert(
-            replace_primary(
-                make_sync_record("llama3:1b", DIGEST_A),
-                imported_model_path=target,
-            )
-        )
+        fake_lmstudio.config = config
+        service.sync(sync_all=True)
 
         entries = service.status()
 
@@ -406,7 +411,7 @@ class TestStatusAndSelection:
         config = make_config()
         service = build_service(config, fake_lmstudio)
         write_manifest(config, digest=DIGEST_A)
-        write_blob(config, DIGEST_A)
+        blob = write_blob(config, DIGEST_A)
         record = make_sync_record("llama3:1b", DIGEST_A)
         target = (
             config.lmstudio_models_dir
@@ -414,7 +419,7 @@ class TestStatusAndSelection:
             / record.import_alias_path.name
         )
         target.parent.mkdir(parents=True)
-        target.write_bytes(b"GGUFxxxx")
+        os.link(blob, target)
         StateStore(config.state_file).upsert(record)
 
         entries = service.status()
@@ -635,7 +640,8 @@ class TestDoctorHardLinkPermission:
 class TestPruneSweepsCopyStaging:
     def test_sweeps_copy_staging_leftovers(self, make_config, fake_lmstudio):
         # Copy-mode aliases are removed after each import; anything found in
-        # .studiolink-imports survived a crash and pins blob space.
+        # .studiolink-imports survived a crash and pins blob space, even an
+        # alias that still matches the current blob.
         config = make_config()
         service = build_service(config, fake_lmstudio)
         write_manifest(config, digest=DIGEST_A)
@@ -651,5 +657,5 @@ class TestPruneSweepsCopyStaging:
         report = service.prune()
 
         removed = {result.path for result in report.aliases if result.removed}
-        assert leftover in removed
-        assert healthy.exists()
+        assert removed == {leftover, healthy}
+        assert blob.stat().st_nlink == 1

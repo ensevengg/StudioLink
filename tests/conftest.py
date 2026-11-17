@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -89,7 +91,7 @@ def write_manifest(
     repository: str = "llama3",
     tag: str = "1b",
     digest: str = DIGEST_A,
-    size: int = 1234,
+    size: int = 12,
     content: object | None = None,
     raw_text: str | None = None,
 ) -> Path:
@@ -165,8 +167,14 @@ class FakeLMStudio:
         self.calls: list[dict] = []
         self.fail_for: set[str] = set()
         self.timeout_for: set[str] = set()
+        self.config: StudioLinkConfig | None = None
         self.models_dir: Path | None = None
         self.inventory_override: tuple[LMStudioModel, ...] | None = None
+
+    def _root(self) -> Path | None:
+        if self.config is not None:
+            return self.config.lmstudio_models_dir
+        return self.models_dir
 
     def get_version(self) -> str | None:
         return "0.3.17 (fake)"
@@ -177,13 +185,14 @@ class FakeLMStudio:
     def list_models(self) -> tuple[LMStudioModel, ...]:
         if self.inventory_override is not None:
             return self.inventory_override
-        if self.models_dir is None or not self.models_dir.exists():
+        root = self._root()
+        if root is None or not root.exists():
             return ()
         inventory = []
-        for path in self.models_dir.rglob("*.gguf"):
+        for path in root.rglob("*.gguf"):
             if path.name.startswith("mmproj-"):
                 continue
-            relative = path.relative_to(self.models_dir)
+            relative = path.relative_to(root)
             inventory.append(
                 LMStudioModel(
                     model_key=path.stem,
@@ -219,10 +228,16 @@ class FakeLMStudio:
             )
         if source_path in self.timeout_for:
             raise subprocess.TimeoutExpired(cmd=["lms"], timeout=3600)
-        if not dry_run and self.models_dir is not None:
-            target = self.models_dir / user_repo / Path(source_path).name
+        root = self._root()
+        if root is not None and not dry_run:
+            target = root / user_repo / Path(source_path).name
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(Path(source_path).read_bytes())
+            if link_mode is LinkMode.HARD_LINK:
+                os.link(source_path, target)
+            elif link_mode is LinkMode.SYMBOLIC_LINK:
+                target.symlink_to(source_path)
+            else:
+                shutil.copyfile(source_path, target)
         return ImportResult(
             command=("lms", "import", source_path),
             stdout="",
@@ -244,8 +259,26 @@ def make_syncer(make_config, fake_lmstudio):
 
     def _make(config: StudioLinkConfig | None = None):
         cfg = config or make_config()
-        fake_lmstudio.models_dir = cfg.lmstudio_models_dir
+        fake_lmstudio.config = cfg
         syncer = Syncer(cfg, fake_lmstudio, StateStore(cfg.state_file))
         return syncer, cfg, fake_lmstudio
 
     return _make
+
+
+class FilesystemLMStudio(FakeLMStudio):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+@pytest.fixture
+def library(make_config):
+    config = make_config()
+    adapter = FilesystemLMStudio(config)
+    from studiolink.service import StudioLinkService
+
+    service = StudioLinkService(config=config, lmstudio=adapter)
+    manifest = write_manifest(config)
+    blob = write_blob(config, DIGEST_A)
+    return config, service, adapter, manifest, blob

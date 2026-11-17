@@ -31,7 +31,7 @@ class TestScanHappyPath:
         assert model.readiness is ModelReadiness.READY
         assert model.blob_path == config.ollama_blobs_dir / blob_filename(DIGEST_A)
         assert model.blob_size == 12  # 4 header bytes + 8 padding
-        assert model.declared_size == 1234
+        assert model.declared_size == 12
         assert model.issues == ()
 
     def test_scans_model_and_projector_as_one_ready_model(self, make_config):
@@ -40,9 +40,10 @@ class TestScanHappyPath:
             Path(__file__).parent / "fixtures" / "ollama" / "llava-latest-manifest.json"
         )
         content = json.loads(fixture.read_text(encoding="utf-8"))
-        write_manifest(config, repository="llava", content=content)
         for layer in content["layers"][:2]:
-            write_blob(config, layer["digest"])
+            # Declared sizes must match the stand-in blobs, not the real weights.
+            layer["size"] = write_blob(config, layer["digest"]).stat().st_size
+        write_manifest(config, repository="llava", content=content)
 
         model = scan_one(config)
 
@@ -188,14 +189,14 @@ class TestMalformedManifests:
         broken = write_manifest(config, repository="broken", digest=DIGEST_A)
         write_manifest(config, repository="healthy", digest=DIGEST_A)
         write_blob(config, DIGEST_A)
-        real_read_text = Path.read_text
+        real_read_bytes = Path.read_bytes
 
-        def flaky_read_text(path, *args, **kwargs):
+        def flaky_read_bytes(path, *args, **kwargs):
             if path == broken:
                 raise OSError("access denied")
-            return real_read_text(path, *args, **kwargs)
+            return real_read_bytes(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", flaky_read_text)
+        monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
 
         report = OllamaAdapter(config).scan_report()
 
@@ -294,3 +295,38 @@ class TestManifestLayout:
         write_manifest(config, repository="alpha", tag="1b", digest=DIGEST_A)
         models = OllamaAdapter(config).scan_models()
         assert [m.repository for m in models] == ["alpha", "zeta"]
+
+
+class TestImportValidation:
+    def test_null_layers_does_not_abort_other_models(self, make_config):
+        config = make_config()
+        write_manifest(config, repository="broken", content={"layers": None})
+        write_manifest(config, repository="healthy")
+        write_blob(config, DIGEST_A)
+        models = OllamaAdapter(config).scan_models()
+        assert len(models) == 2
+        assert models[0].readiness is ModelReadiness.INVALID
+        assert models[1].readiness is ModelReadiness.READY
+
+    def test_truncated_blob_is_invalid_even_with_gguf_header(self, make_config):
+        config = make_config()
+        write_manifest(config, size=10000)
+        write_blob(config, DIGEST_A)
+        assert scan_one(config).readiness is ModelReadiness.INVALID
+
+    def test_non_utf8_manifest_does_not_abort_scan(self, make_config):
+        config = make_config()
+        path = write_manifest(config)
+        path.write_bytes(b"\xff")
+        report = OllamaAdapter(config).scan_report()
+        assert not report.complete
+        assert report.errors
+
+    def test_digest_cannot_escape_blob_directory(self, make_config, tmp_path):
+        config = make_config()
+        outside = tmp_path / "outside.gguf"
+        outside.write_bytes(b"GGUF00000000")
+        write_manifest(config, digest=str(outside), size=12)
+        model = scan_one(config)
+        assert model.readiness is ModelReadiness.INVALID
+        assert model.blob_path is None

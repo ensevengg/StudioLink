@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
-from studiolink.config import StudioLinkConfig
+from studiolink.config import StudioLinkConfig, lmstudio_models_directory
+from studiolink.files import destination_path, healthy_destination
 from studiolink.models import ImportResult, LinkMode, LMStudioModel
+from studiolink.transactions import TRANSACTIONS, import_transaction, publish_import
 
 DEFAULT_TIMEOUT = 60
 # Importing with --copy moves multi-GB GGUF files; give it an hour instead of
@@ -117,34 +120,64 @@ class LMStudioAdapter:
         link_mode: LinkMode,
         dry_run: bool = False,
     ) -> ImportResult:
-        command = [
-            str(self.config.lms_exe),
-            "import",
-            source_path,
-            "--yes",
-            "--user-repo",
-            user_repo,
-            link_mode.lms_flag,
-        ]
-        if dry_run:
-            command.append("--dry-run")
-
-        try:
-            result = self._run(command, check=True, timeout=IMPORT_TIMEOUT)
-        except subprocess.CalledProcessError as exc:
+        actual_directory = lmstudio_models_directory(Path.home())
+        if actual_directory.resolve() != self.config.lmstudio_models_dir.resolve():
             raise LMStudioError(
-                f"LM Studio import failed for {source_path}: {exc.stderr}",
-                exc.cmd,
-                exc.returncode,
-                exc.stderr,
-            ) from exc
-        return ImportResult(
-            command=tuple(command),
-            stdout=result.stdout,
-            stderr=result.stderr,
-            return_code=result.returncode,
-            dry_run=dry_run,
+                "StudioLink's models directory differs from LM Studio's models directory "
+                f"({actual_directory}); update LM Studio's models setting or "
+                "STUDIOLINK_LMSTUDIO_MODELS_DIR before importing",
+                [],
+                -1,
+                "models directory mismatch",
+            )
+        source = Path(source_path).absolute()
+        target = destination_path(
+            self.config.lmstudio_models_dir, user_repo, source.name
         )
+        if target.exists() or target.is_symlink():
+            raise LMStudioError(
+                f"Import destination already exists: {target}",
+                [],
+                -1,
+                "destination exists",
+            )
+        with import_transaction(self.config.lmstudio_models_dir, source.name) as staged:
+            command = [
+                str(self.config.lms_exe),
+                "import",
+                str(source),
+                "--yes",
+                "--user-repo",
+                f"{TRANSACTIONS}/{staged.parent.name}",
+                link_mode.lms_flag,
+            ]
+            if dry_run:
+                command.append("--dry-run")
+            try:
+                result = self._run(command, check=True, timeout=IMPORT_TIMEOUT)
+            except subprocess.CalledProcessError as exc:
+                raise LMStudioError(
+                    f"LM Studio import failed for {source_path}: {exc.stderr or exc.stdout}",
+                    exc.cmd,
+                    exc.returncode,
+                    exc.stderr,
+                ) from exc
+            if not dry_run:
+                if not healthy_destination(staged, source, link_mode):
+                    raise LMStudioError(
+                        f"LM Studio produced an invalid {link_mode} import",
+                        command,
+                        -1,
+                        "invalid imported file",
+                    )
+                publish_import(staged, target)
+            return ImportResult(
+                command=tuple(command),
+                stdout=f"Imported model to {target}" if not dry_run else result.stdout,
+                stderr=result.stderr,
+                return_code=result.returncode,
+                dry_run=dry_run,
+            )
 
     @staticmethod
     def _run(
@@ -169,7 +202,7 @@ class LMStudioAdapter:
             ) from exc
         except OSError as exc:
             raise LMStudioError(
-                f"Could not execute LM Studio CLI: {exc}",
+                f"Could not run LM Studio CLI {command[0]}: {exc}",
                 command,
                 -1,
                 str(exc),

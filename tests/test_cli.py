@@ -221,7 +221,12 @@ class TestPruneCommand:
     def test_prune_json(self, fake_service, capsys):
         assert cli.main(["prune", "--json"]) == 0
         payload = json.loads(out(capsys))
-        assert payload == {"dry_run": False, "aliases": [], "records_removed": []}
+        assert payload == {
+            "dry_run": False,
+            "aliases": [],
+            "imports": [],
+            "records_removed": [],
+        }
 
     def test_prune_reports_aliases(self, fake_service, monkeypatch, capsys):
         from pathlib import Path
@@ -339,3 +344,37 @@ class TestUpgradeCommand:
         text = err(capsys)
         assert "externally-managed-environment" in text
         assert "virtualenv" in text
+
+
+def test_prune_failure_does_not_claim_space_was_freed(
+    fake_service, monkeypatch, capsys, tmp_path
+):
+    from studiolink.models import PruneResult
+
+    report = PruneReport(
+        dry_run=False,
+        imports=(
+            PruneResult(tmp_path / "model.gguf", 100, True, "permission denied", False),
+        ),
+    )
+    monkeypatch.setattr(fake_service, "prune", lambda **kwargs: report)
+    assert cli.main(["prune"]) == 1
+    output = out(capsys)
+    assert "Failed to remove" in output
+    assert "bytes freed" not in output
+
+
+def test_prune_displays_destination_cleanup(
+    fake_service, monkeypatch, capsys, tmp_path
+):
+    from studiolink.models import PruneResult
+
+    report = PruneReport(
+        dry_run=False,
+        imports=(PruneResult(tmp_path / "model.gguf", 100, True, "obsolete", True),),
+    )
+    monkeypatch.setattr(fake_service, "prune", lambda **kwargs: report)
+    assert cli.main(["prune"]) == 0
+    output = out(capsys)
+    assert "model.gguf" in output
+    assert "100 bytes freed" in output

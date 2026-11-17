@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from studiolink.config import StudioLinkConfig
+from studiolink.files import (
+    artifact_destination,
+    destination_path,
+    healthy_destination,
+    identity,
+    owns_destination,
+    remove_import,
+    same_file,
+)
 from studiolink.lmstudio_adapter import LMStudioError
 from studiolink.models import (
     ArtifactRole,
     ImportMode,
     ImportResult,
     LinkMode,
+    LMStudioModel,
     ModelReadiness,
     OllamaArtifact,
     OllamaModel,
@@ -21,31 +35,20 @@ from studiolink.models import (
     SyncRecord,
     SyncResult,
     is_synced,
+    model_artifacts,
 )
 from studiolink.ports import LMStudioPort
 from studiolink.state import StateStore
+from studiolink.transactions import (
+    hardlinks_unsupported,
+    import_transaction,
+    recover_imports,
+)
 
 logger = logging.getLogger("studiolink")
 
 INVENTORY_ATTEMPTS = 10
 INVENTORY_RETRY_DELAY = 0.5
-
-
-def same_file(left: Path, right: Path) -> bool:
-    """Check whether two paths reference the same inode (hard link)."""
-    try:
-        left_stat, right_stat = left.stat(), right.stat()
-    except OSError:
-        return False
-    if left_stat.st_ino == 0 or right_stat.st_ino == 0:
-        # Filesystems without file ids (FAT/exFAT) report inode 0, which
-        # would make every file on the volume compare equal and reuse a
-        # stale alias. Identity is unknowable there, so never match.
-        return False
-    return (left_stat.st_dev, left_stat.st_ino) == (
-        right_stat.st_dev,
-        right_stat.st_ino,
-    )
 
 
 class Syncer:
@@ -73,13 +76,32 @@ class Syncer:
             import_mode,
             dry_run,
         )
+        with self.state.lock():
+            return self._sync_locked(models, link_mode, import_mode, dry_run)
+
+    def _sync_locked(
+        self,
+        models: list[OllamaModel],
+        link_mode: LinkMode,
+        import_mode: ImportMode,
+        dry_run: bool,
+    ) -> list[SyncResult]:
+        if not dry_run:
+            recover_imports(self.config.lmstudio_models_dir)
         records = self.state.get_all_records()
         logger.debug("Loaded %d existing sync record(s)", len(records))
         results: list[SyncResult] = []
         for model in models:
-            result = self._sync_one(model, records, link_mode, import_mode, dry_run)
+            try:
+                result = self._sync_one(model, records, link_mode, import_mode, dry_run)
+            except (OSError, RuntimeError, ValueError) as exc:
+                result = SyncResult(model=model, status="error", message=str(exc))
             results.append(result)
-            if result.record and not dry_run:
+            if (
+                result.record
+                and not dry_run
+                and result.record != records.get(model.canonical_name)
+            ):
                 records[result.record.canonical_name] = result.record
                 self.state.save(records)
                 logger.debug("Saved sync record for %s", model.canonical_name)
@@ -98,53 +120,43 @@ class Syncer:
             model.canonical_name,
             model.readiness,
         )
+        root = self.config.lmstudio_models_dir
         existing = records.get(model.canonical_name)
-        expected_target = None
-        if existing is not None and existing.imported_model_path is None:
-            expected_target = (
-                self.config.lmstudio_models_dir
-                / existing.user_repo
-                / existing.import_alias_path.name
-            )
-        already_synced = is_synced(model, existing, expected_target=expected_target)
-        has_projector = any(
-            artifact.role is ArtifactRole.PROJECTOR for artifact in model.artifacts
-        )
-        if already_synced and not has_projector:
+        sources = model_artifacts(model)
+        if (
+            existing is not None
+            and is_synced(model, existing, root)
+            and existing.link_mode is link_mode
+        ):
             logger.debug("Model %s is already synced, skipping", model.canonical_name)
+            verified = self._verified_record(existing, sources)
+            message = "imported file verified; already synced"
+            if len(sources) == 1 or dry_run:
+                return SyncResult(
+                    model=model, status="skipped", message=message, record=verified
+                )
+            # LM Studio may have stopped pairing the projector since the last
+            # sync, so a bundle is only skipped after its inventory is rechecked.
+            return self._confirm_bundle(model, verified, "skipped", message)
+        if model.readiness is ModelReadiness.STALE:
+            logger.debug("Model %s has a missing artifact", model.canonical_name)
             return SyncResult(
                 model=model,
-                status="skipped",
-                message="already synced according to StudioLink state",
-                record=existing,
+                status="error",
+                message=(
+                    "model artifact is missing from the Ollama blob store; "
+                    f"run `ollama pull {model.canonical_name}` to restore it"
+                ),
             )
-        if not already_synced:
-            # A complete import that Ollama can no longer back is still fine
-            # to keep; only a model we are about to (re-)import must be
-            # blocked by stale or invalid artifacts.
-            if model.readiness is ModelReadiness.STALE:
-                logger.debug("Model %s has a missing artifact", model.canonical_name)
-                return SyncResult(
-                    model=model,
-                    status="error",
-                    message=(
-                        "model artifact is missing from the Ollama blob store; "
-                        f"run `ollama pull {model.canonical_name}` to restore it"
-                    ),
-                )
-            if model.readiness is ModelReadiness.INVALID:
-                logger.debug(
-                    "Model %s is invalid: %s", model.canonical_name, model.issues
-                )
-                return SyncResult(
-                    model=model,
-                    status="error",
-                    message="model is not ready for import: "
-                    + "; ".join(model.issues or ("unknown error",)),
-                )
-
-        artifacts = self._model_artifacts(model)
-        if import_mode is ImportMode.DIRECT and len(artifacts) > 1:
+        if model.readiness is ModelReadiness.INVALID or not sources:
+            logger.debug("Model %s is invalid: %s", model.canonical_name, model.issues)
+            return SyncResult(
+                model=model,
+                status="error",
+                message="model is not ready for import: "
+                + "; ".join(model.issues or ("unknown error",)),
+            )
+        if import_mode is ImportMode.DIRECT and len(sources) > 1:
             return SyncResult(
                 model=model,
                 status="error",
@@ -153,351 +165,447 @@ class Syncer:
                     "projector imports require an mmproj- alias"
                 ),
             )
+        if dry_run:
+            try:
+                targets = ", ".join(
+                    str(
+                        destination_path(
+                            root,
+                            model.import_user_repo,
+                            self._source_path(model, artifact, import_mode).name,
+                        )
+                    )
+                    for artifact in sources
+                )
+            except ValueError as exc:
+                return SyncResult(model=model, status="error", message=str(exc))
+            return SyncResult(
+                model=model,
+                status="dry-run",
+                message=f"Would sync using {link_mode}: {targets}",
+            )
 
-        existing_by_identity = {
-            (artifact.role, artifact.digest): artifact
-            for artifact in (existing.artifacts if existing is not None else ())
-        }
-        destination_dir = self.config.lmstudio_models_dir / model.import_user_repo
         completed: list[SyncedArtifact] = []
-        last_result: ImportResult | None = None
-        imported_at = (
-            existing.imported_at
+        message = "imported successfully"
+        for source in sources:
+            try:
+                artifact, import_result = self._sync_artifact(
+                    model, source, existing, records, link_mode, import_mode
+                )
+            except (
+                LMStudioError,
+                subprocess.TimeoutExpired,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                return self._partial_result(
+                    model, existing, completed, link_mode, str(exc)
+                )
+            completed.append(artifact)
+            message = _format_import_message(import_result)
+
+        record = self._make_record(model, completed, link_mode)
+        if len(completed) == 1:
+            result = SyncResult(
+                model=model, status="synced", message=message, record=record
+            )
+        else:
+            # Confirm a bundle before reclaiming the one it replaces, so a
+            # bundle LM Studio rejects never costs the previous working one.
+            result = self._confirm_bundle(model, record, "synced", message)
+            if result.status == "error":
+                if existing is not None and not (
+                    self._targets(existing) <= self._targets(record)
+                ):
+                    # Keep the previous import tracked; a retry adopts the
+                    # new files without another copy.
+                    return replace(result, record=None)
+                return result
+            record = result.record or record
+        if existing is not None:
+            try:
+                self._reclaim(existing, record, records)
+            except (OSError, RuntimeError, ValueError) as exc:
+                # Keep the old record so its cleanup is retried; the new import
+                # is verified and will be adopted without another copy.
+                return SyncResult(model=model, status="error", message=str(exc))
+        return result
+
+    def _sync_artifact(
+        self,
+        model: OllamaModel,
+        source: OllamaArtifact,
+        existing: SyncRecord | None,
+        records: dict[str, SyncRecord],
+        link_mode: LinkMode,
+        import_mode: ImportMode,
+    ) -> tuple[SyncedArtifact, ImportResult]:
+        blob, digest = source.blob_path, source.digest
+        if blob is None or digest is None:
+            raise RuntimeError(f"{source.role.value} artifact is not importable")
+        if import_mode is ImportMode.DIRECT:
+            alias_path = blob
+            alias_created = False
+            logger.debug("Using Ollama blob directly: %s", alias_path)
+        else:
+            alias_path, alias_created = self._ensure_import_alias(
+                model, source, link_mode
+            )
+            logger.debug(
+                "Importing %s via LM Studio: %s (mode=%s)",
+                source.role,
+                alias_path,
+                link_mode,
+            )
+
+        root = self.config.lmstudio_models_dir
+        target = destination_path(root, model.import_user_repo, alias_path.name)
+        prior = None
+        if existing is not None:
+            prior = next(
+                (
+                    artifact
+                    for artifact in existing.artifacts
+                    if artifact_destination(existing, artifact, root) == target
+                ),
+                None,
+            )
+        import_result = ImportResult(
+            command=(), stdout="existing import verified", stderr="", return_code=0
+        )
+        target_artifact = (
+            prior
             if existing is not None
-            else datetime.now(tz=timezone.utc)
+            and prior is not None
+            and prior.digest == digest
+            and existing.link_mode is link_mode
+            else None
         )
-
-        for artifact in artifacts:
-            # A None digest can never match a stored record (records always
-            # carry a real digest), so the importability check below reports
-            # it after the reuse lookup.
-            prior = (
-                existing_by_identity.get((artifact.role, artifact.digest))
-                if artifact.digest is not None
-                else None
-            )
-            prior_target = prior.imported_model_path if prior is not None else None
-            if prior is not None and prior_target is None:
-                prior_target = (
-                    self.config.lmstudio_models_dir
-                    / (existing.user_repo if existing else model.import_user_repo)
-                    / prior.import_alias_path.name
-                )
-            if (
-                prior is not None
-                and prior_target is not None
-                and prior_target.is_file()
-                # A changed sibling digest also changes import_user_repo.
-                # Reusing the artifact from the old bundle directory would
-                # split the pair across LM Studio directories and break
-                # vision pairing, so re-import into the current destination.
-                and prior_target.parent == destination_dir
+        success = False
+        try:
+            if not healthy_destination(target, blob, link_mode, target_artifact):
+                if target.exists() or target.is_symlink():
+                    managed = (
+                        existing is not None
+                        and prior is not None
+                        and owns_destination(existing, prior, target)
+                    )
+                    # Lost state can be rebuilt from a verified import even
+                    # when the requested mode differs from its current mode.
+                    recoverable = existing is None and any(
+                        healthy_destination(target, blob, candidate)
+                        for candidate in LinkMode
+                    )
+                    if not (managed or recoverable):
+                        raise RuntimeError(
+                            f"Import destination already exists and is not verified: {target}"
+                        )
+                    # Build beside the destination and replace atomically. A
+                    # failed conversion leaves the old import usable.
+                    self._replace_destination(
+                        alias_path, target, link_mode, blob, digest, records
+                    )
+                    import_result = ImportResult(
+                        command=(),
+                        stdout=f"Replaced managed import: {target}",
+                        stderr="",
+                        return_code=0,
+                    )
+                elif link_mode is LinkMode.COPY and self._reuse_copy(
+                    blob, digest, records, target
+                ):
+                    import_result = ImportResult(
+                        command=(),
+                        stdout="Reused existing copy of identical weights",
+                        stderr="",
+                        return_code=0,
+                    )
+                else:
+                    import_result = self.lmstudio.import_model(
+                        str(alias_path.absolute()),
+                        user_repo=model.import_user_repo,
+                        link_mode=link_mode,
+                        dry_run=False,
+                    )
+                if not healthy_destination(target, blob, link_mode):
+                    raise RuntimeError(
+                        f"LM Studio did not create the expected {link_mode} import at {target}; "
+                        "check that STUDIOLINK_LMSTUDIO_MODELS_DIR matches LM Studio's models directory"
+                    )
+            success = True
+        finally:
+            if import_mode is not ImportMode.DIRECT and (
+                (alias_created and not success) or link_mode is LinkMode.COPY
             ):
-                completed.append(
-                    SyncedArtifact(
-                        role=prior.role,
-                        digest=prior.digest,
-                        blob_path=prior.blob_path,
-                        import_alias_path=prior.import_alias_path,
-                        imported_model_path=prior_target,
-                        import_command=prior.import_command,
-                    )
-                )
-                continue
+                # Preserve a symlink target if import succeeded but a later cleanup
+                # failed. A subsequent sync can adopt that verified destination.
+                if not (target.is_symlink() and same_file(target, alias_path)):
+                    alias_path.unlink(missing_ok=True)
+                    if link_mode is LinkMode.COPY:
+                        try:
+                            alias_path.parent.rmdir()
+                        except OSError:
+                            pass
 
-            if artifact.digest is None or artifact.blob_path is None:
-                return SyncResult(
-                    model=model,
-                    status="error",
-                    message=f"{artifact.role.value} artifact is not importable",
-                )
+        artifact = SyncedArtifact(
+            role=source.role,
+            digest=digest,
+            blob_path=blob,
+            import_alias_path=alias_path,
+            imported_model_path=target,
+            import_command=import_result.command
+            or (prior.import_command if prior is not None else ()),
+            imported_identity=identity(target),
+        )
+        return artifact, import_result
 
-            if import_mode is ImportMode.DIRECT:
-                alias_path = artifact.blob_path
-                alias_created = False
-            else:
-                try:
-                    alias_path, alias_created = self._ensure_import_alias(
-                        model, artifact, link_mode
-                    )
-                except RuntimeError as exc:
-                    return self._partial_result(
-                        model,
-                        records,
-                        completed,
-                        link_mode,
-                        imported_at,
-                        str(exc),
-                        dry_run,
-                    )
+    def _source_path(
+        self, model: OllamaModel, artifact: OllamaArtifact, import_mode: ImportMode
+    ) -> Path:
+        if import_mode is ImportMode.DIRECT and artifact.blob_path is not None:
+            return artifact.blob_path
+        return self.config.import_staging_dir / model.artifact_import_filename(artifact)
 
-            import_result: ImportResult | None = None
-            import_error: Exception | None = None
-            try:
-                import_result = self.lmstudio.import_model(
-                    str(alias_path),
-                    user_repo=model.import_user_repo,
-                    link_mode=link_mode,
-                    dry_run=dry_run,
-                )
-            except (LMStudioError, subprocess.TimeoutExpired) as exc:
-                import_error = exc
-            finally:
-                self._clean_temporary_alias(
-                    alias_path,
-                    alias_created,
-                    link_mode,
-                    import_mode,
-                    dry_run,
-                )
-
-            if import_error is not None or import_result is None:
-                message = (
-                    str(import_error)
-                    if import_error is not None
-                    else "LM Studio import returned no result"
-                )
-                return self._partial_result(
-                    model,
-                    records,
-                    completed,
-                    link_mode,
-                    imported_at,
-                    message,
-                    dry_run,
-                )
-
-            last_result = import_result
-            completed.append(
-                SyncedArtifact(
-                    role=artifact.role,
-                    digest=artifact.digest,
-                    blob_path=artifact.blob_path,
-                    import_alias_path=alias_path,
-                    imported_model_path=(
-                        self.config.lmstudio_models_dir
-                        / model.import_user_repo
-                        / alias_path.name
-                    ),
-                    import_command=import_result.command,
+    def _verified_record(
+        self, record: SyncRecord, sources: tuple[OllamaArtifact, ...]
+    ) -> SyncRecord:
+        artifacts = []
+        for artifact, source in zip(record.artifacts, sources):
+            target = artifact_destination(
+                record, artifact, self.config.lmstudio_models_dir
+            )
+            artifacts.append(
+                replace(
+                    artifact,
+                    imported_model_path=target,
+                    imported_identity=identity(target),
+                    blob_path=source.blob_path or artifact.blob_path,
                 )
             )
-            if not dry_run and any(
-                artifact.role is ArtifactRole.MODEL for artifact in completed
-            ):
-                # Never persist a partial without the model artifact: its
-                # serialization requires a primary.
-                partial = self._make_record(
-                    model, completed, link_mode, imported_at, vision_confirmed=False
-                )
-                records[model.canonical_name] = partial
-                self.state.save(records)
-
-        vision_confirmed = True
-        if len(artifacts) > 1 and not dry_run:
-            try:
-                vision_confirmed = self._vision_bundle_is_indexed(model, completed)
-            except LMStudioError as exc:
-                return self._partial_result(
-                    model,
-                    records,
-                    completed,
-                    link_mode,
-                    imported_at,
-                    str(exc),
-                    dry_run,
-                )
-            if not vision_confirmed:
-                return self._partial_result(
-                    model,
-                    records,
-                    completed,
-                    link_mode,
-                    imported_at,
-                    "LM Studio did not index the projector bundle as vision-capable",
-                    dry_run,
-                )
-
-        record = self._make_record(
-            model, completed, link_mode, imported_at, vision_confirmed=vision_confirmed
-        )
-        if not dry_run:
-            records[model.canonical_name] = record
-            self.state.save(records)
-        status = "dry-run" if dry_run else "synced"
-        if already_synced and last_result is None and not dry_run:
-            status = "skipped"
-        return SyncResult(
-            model=model,
-            status=status,
-            message=(
-                _format_import_message(last_result)
-                if last_result is not None
-                else "imported artifacts already present"
-            ),
-            record=record,
-        )
-
-    @staticmethod
-    def _model_artifacts(model: OllamaModel) -> tuple[OllamaArtifact, ...]:
-        if model.artifacts:
-            return model.artifacts
-        if model.model_digest is None or model.blob_path is None:
-            return ()
-        return (
-            OllamaArtifact(
-                role=ArtifactRole.MODEL,
-                media_type="application/vnd.ollama.image.model",
-                digest=model.model_digest,
-                blob_path=model.blob_path,
-                declared_size=model.declared_size,
-                blob_size=model.blob_size,
-                gguf_valid=model.gguf_valid,
-                manifest_index=0,
-                issues=model.issues,
-            ),
-        )
+        return replace(record, artifacts=tuple(artifacts))
 
     def _make_record(
         self,
         model: OllamaModel,
         artifacts: list[SyncedArtifact],
         link_mode: LinkMode,
-        imported_at: datetime,
-        *,
-        vision_confirmed: bool,
     ) -> SyncRecord:
         return SyncRecord(
             canonical_name=model.canonical_name,
             user_repo=model.import_user_repo,
             link_mode=link_mode,
-            imported_at=imported_at,
+            imported_at=datetime.now(tz=timezone.utc),
             artifacts=tuple(artifacts),
-            vision_confirmed=vision_confirmed,
+            # Bundles are confirmed against LM Studio's inventory afterwards.
+            vision_confirmed=not any(
+                artifact.role is ArtifactRole.PROJECTOR for artifact in artifacts
+            ),
         )
 
     def _partial_result(
         self,
         model: OllamaModel,
-        records: dict[str, SyncRecord],
+        existing: SyncRecord | None,
         completed: list[SyncedArtifact],
         link_mode: LinkMode,
-        imported_at: datetime,
         message: str,
-        dry_run: bool,
     ) -> SyncResult:
         record = None
-        if completed and any(
-            artifact.role is ArtifactRole.MODEL for artifact in completed
-        ):
-            record = self._make_record(
-                model,
-                completed,
-                link_mode,
-                imported_at,
-                vision_confirmed=False,
-            )
-            if not dry_run:
-                records[model.canonical_name] = record
-                self.state.save(records)
+        # Model artifacts import first, so a partial record always has a
+        # primary. Saving it lets a retry resume without another import.
+        if any(artifact.role is ArtifactRole.MODEL for artifact in completed):
+            partial = self._make_record(model, completed, link_mode)
+            # A failed re-pull must not drop the previous import from state:
+            # it stays tracked until a complete replacement can reclaim it.
+            if existing is None or self._targets(existing) <= self._targets(partial):
+                record = partial
         return SyncResult(model=model, status="error", message=message, record=record)
 
-    def _vision_bundle_is_indexed(
-        self, model: OllamaModel, artifacts: list[SyncedArtifact]
-    ) -> bool:
-        primary = next(
-            artifact for artifact in artifacts if artifact.role is ArtifactRole.MODEL
-        )
-        if primary.imported_model_path is None:
-            return False
+    def _targets(self, record: SyncRecord) -> set[Path]:
+        root = self.config.lmstudio_models_dir
+        return {
+            artifact_destination(record, artifact, root)
+            for artifact in record.artifacts
+        }
+
+    def _reclaim(
+        self,
+        existing: SyncRecord,
+        record: SyncRecord,
+        records: dict[str, SyncRecord],
+    ) -> None:
+        """Remove imports and aliases the new record no longer uses."""
+        root = self.config.lmstudio_models_dir
+        keep = self._targets(record)
+        keep.update(artifact.import_alias_path for artifact in record.artifacts)
+        for name, other in records.items():
+            if name != record.canonical_name:
+                keep.update(self._targets(other))
+                keep.update(artifact.import_alias_path for artifact in other.artifacts)
+        remove_import(existing, root, self.config.import_staging_dir, keep=keep)
+
+    def _confirm_bundle(
+        self, model: OllamaModel, record: SyncRecord, status: str, message: str
+    ) -> SyncResult:
         try:
-            expected = primary.imported_model_path.relative_to(
-                self.config.lmstudio_models_dir
-            ).as_posix()
-        except ValueError:
-            return False
+            confirmed = self._vision_bundle_is_indexed(record)
+        except LMStudioError as exc:
+            return SyncResult(
+                model=model,
+                status="error",
+                message=str(exc),
+                record=replace(record, vision_confirmed=False),
+            )
+        if not confirmed:
+            return SyncResult(
+                model=model,
+                status="error",
+                message="LM Studio did not index the projector bundle as vision-capable",
+                record=replace(record, vision_confirmed=False),
+            )
+        return SyncResult(
+            model=model,
+            status=status,
+            message=message,
+            record=replace(record, vision_confirmed=True),
+        )
+
+    def _vision_bundle_is_indexed(self, record: SyncRecord) -> bool:
         for attempt in range(INVENTORY_ATTEMPTS):
-            if any(
-                item.path.replace("\\", "/").casefold() == expected.casefold()
-                and item.vision
-                for item in self.lmstudio.list_models()
+            if bundle_is_indexed(
+                record, self.config.lmstudio_models_dir, self.lmstudio.list_models()
             ):
                 return True
             if attempt + 1 < INVENTORY_ATTEMPTS:
                 time.sleep(INVENTORY_RETRY_DELAY)
         return False
 
-    @staticmethod
-    def _clean_temporary_alias(
-        alias_path: Path,
-        alias_created: bool,
-        link_mode: LinkMode,
-        import_mode: ImportMode,
-        dry_run: bool,
+    def _reuse_copy(
+        self,
+        blob: Path,
+        digest: str,
+        records: dict[str, SyncRecord],
+        target: Path,
+    ) -> bool:
+        root = self.config.lmstudio_models_dir
+        for record in records.values():
+            if record.link_mode is not LinkMode.COPY:
+                continue
+            for artifact in record.artifacts:
+                if artifact.digest != digest:
+                    continue
+                source = artifact_destination(record, artifact, root)
+                if source == target or not healthy_destination(
+                    source, blob, LinkMode.COPY, artifact
+                ):
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, target)
+                except OSError as exc:
+                    if exc.errno == errno.EXDEV or hardlinks_unsupported(exc):
+                        # The caller falls back to an ordinary copy.
+                        continue
+                    raise
+                return True
+        return False
+
+    def _replace_destination(
+        self,
+        source: Path,
+        target: Path,
+        mode: LinkMode,
+        blob: Path,
+        digest: str,
+        records: dict[str, SyncRecord],
     ) -> None:
-        should_remove = dry_run or link_mode is LinkMode.COPY
-        if not (
-            should_remove
-            and (alias_created or link_mode is LinkMode.COPY)
-            and alias_path.exists()
-            and import_mode is not ImportMode.DIRECT
-        ):
-            return
-        try:
-            alias_path.unlink()
-            alias_path.parent.rmdir()
-        except OSError as exc:
-            logger.warning("Could not clean up import alias %s: %s", alias_path, exc)
+        with import_transaction(
+            self.config.lmstudio_models_dir, target.name
+        ) as temporary:
+            if mode is LinkMode.HARD_LINK:
+                os.link(source.resolve(), temporary)
+            elif mode is LinkMode.SYMBOLIC_LINK:
+                temporary.symlink_to(source.absolute())
+            elif not self._reuse_copy(blob, digest, records, temporary):
+                shutil.copyfile(source, temporary)
+            os.replace(temporary, target)
 
     def _ensure_import_alias(
-        self,
-        model: OllamaModel,
-        artifact: OllamaArtifact,
-        link_mode: LinkMode,
+        self, model: OllamaModel, artifact: OllamaArtifact, link_mode: LinkMode
     ) -> tuple[Path, bool]:
-        staging_dir = self.config.import_staging_dir
+        staging = self.config.import_staging_dir
         if link_mode is LinkMode.COPY:
             # The alias controls the human-readable LM Studio filename. Keep
             # this temporary hard link on the Ollama filesystem so copy mode
             # still works when StudioLink state lives on another volume.
-            staging_dir = self.config.ollama_models_dir / ".studiolink-imports"
-        return _ensure_import_alias(model, staging_dir, artifact)
+            staging = self.config.ollama_models_dir / ".studiolink-imports"
+        return _ensure_import_alias(model, staging, link_mode, artifact)
+
+
+def bundle_is_indexed(
+    record: SyncRecord, root: Path, inventory: tuple[LMStudioModel, ...]
+) -> bool:
+    """Check that LM Studio paired the record's projector with its model."""
+    try:
+        expected = (
+            artifact_destination(record, record.primary_artifact, root)
+            .relative_to(root.absolute())
+            .as_posix()
+        )
+    except ValueError:
+        return False
+    return any(
+        item.path.replace("\\", "/").casefold() == expected.casefold() and item.vision
+        for item in inventory
+    )
 
 
 def _ensure_import_alias(
     model: OllamaModel,
     staging_dir: Path,
+    link_mode: LinkMode = LinkMode.HARD_LINK,
     artifact: OllamaArtifact | None = None,
 ) -> tuple[Path, bool]:
     blob_path = artifact.blob_path if artifact is not None else model.blob_path
-    alias_name = (
+    alias_path = staging_dir / (
         model.artifact_import_filename(artifact)
         if artifact is not None
         else model.import_filename
     )
-    alias_path = staging_dir / alias_name
     if blob_path is None:
         raise RuntimeError(f"No blob path for model {model.canonical_name}")
-    if alias_path.exists():
-        if same_file(alias_path, blob_path):
-            logger.debug("Import alias already exists: %s", alias_path)
-            return alias_path, False
-        # The alias survived a re-pull but now points at the old blob content;
-        # replace it so we never import stale weights.
-        logger.debug("Replacing stale import alias: %s", alias_path)
-        try:
-            alias_path.unlink()
-        except OSError as exc:
-            raise RuntimeError(
-                f"Failed to replace stale import alias {alias_path}: {exc}"
-            ) from exc
+    present = alias_path.exists() or alias_path.is_symlink()
+    if (
+        present
+        and same_file(alias_path, blob_path)
+        and (link_mode is not LinkMode.HARD_LINK or not alias_path.is_symlink())
+    ):
+        return alias_path, False
+    temporary = alias_path
     try:
         staging_dir.mkdir(parents=True, exist_ok=True)
-        os.link(blob_path, alias_path)
+        if present:
+            # Replace a stale alias atomically so a failure keeps the old link.
+            fd, name = tempfile.mkstemp(prefix=".studiolink-", dir=staging_dir)
+            os.close(fd)
+            temporary = Path(name)
+            temporary.unlink()
+        try:
+            os.link(blob_path, temporary)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV or link_mode is LinkMode.HARD_LINK:
+                raise
+            # Stage across volumes without writing another full copy.
+            temporary.symlink_to(blob_path.resolve())
+        if present:
+            os.replace(temporary, alias_path)
+        return alias_path, True
     except OSError as exc:
-        raise RuntimeError(f"Failed to create import alias (hard link): {exc}") from exc
-    logger.debug("Created hard link: %s -> %s", alias_path, blob_path)
-    return alias_path, True
+        raise RuntimeError(f"Failed to create import alias: {exc}") from exc
+    finally:
+        if temporary != alias_path:
+            temporary.unlink(missing_ok=True)
 
 
 def _format_import_message(result: ImportResult) -> str:

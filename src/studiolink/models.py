@@ -110,7 +110,8 @@ class OllamaModel:
     def user_repo(self) -> str:
         repo_parts = []
         if self.registry != "registry.ollama.ai":
-            repo_parts.append(self.registry.replace(".", "-"))
+            # ":" (a registry port) is not allowed in Windows directory names.
+            repo_parts.append(self.registry.replace(".", "-").replace(":", "-"))
         if self.namespace != "library":
             repo_parts.append(self.namespace)
         repo_parts.append(self.repository.replace("/", "--"))
@@ -157,6 +158,18 @@ class OllamaScanReport:
     errors: tuple[str, ...] = ()
 
 
+def _parse_identity(raw: object) -> tuple[int, int, int, int] | None:
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 4
+        or not all(isinstance(value, int) for value in raw)
+    ):
+        raise TypeError("imported_identity must contain four integers")
+    return raw[0], raw[1], raw[2], raw[3]
+
+
 @dataclass(slots=True, frozen=True)
 class SyncedArtifact:
     role: ArtifactRole
@@ -165,6 +178,7 @@ class SyncedArtifact:
     import_alias_path: Path
     imported_model_path: Path | None = None
     import_command: tuple[str, ...] = field(default_factory=tuple)
+    imported_identity: tuple[int, int, int, int] | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -178,6 +192,9 @@ class SyncedArtifact:
                 else str(self.imported_model_path)
             ),
             "import_command": list(self.import_command),
+            "imported_identity": (
+                None if self.imported_identity is None else list(self.imported_identity)
+            ),
         }
 
     @classmethod
@@ -196,6 +213,7 @@ class SyncedArtifact:
                 else None
             ),
             import_command=tuple(str(item) for item in import_command),
+            imported_identity=_parse_identity(payload.get("imported_identity")),
         )
 
 
@@ -289,6 +307,7 @@ class SyncRecord:
                         else None
                     ),
                     import_command=tuple(str(item) for item in import_command),
+                    imported_identity=_parse_identity(payload.get("imported_identity")),
                 ),
             )
         if sum(artifact.role is ArtifactRole.MODEL for artifact in artifacts) != 1:
@@ -311,36 +330,59 @@ class SyncRecord:
         )
 
 
-def is_synced(
-    model: OllamaModel,
-    record: SyncRecord | None,
-    *,
-    expected_target: Path | None = None,
-) -> bool:
-    """Check if state and every imported LM Studio artifact match the model."""
-    if record is None:
-        return False
-    expected = (
-        tuple((artifact.role, artifact.digest) for artifact in model.artifacts)
-        if model.artifacts
-        else ((ArtifactRole.MODEL, model.model_digest),)
+def model_artifacts(model: OllamaModel) -> tuple[OllamaArtifact, ...]:
+    """Artifacts to import; models built without a manifest scan have one."""
+    if model.artifacts:
+        return model.artifacts
+    if model.model_digest is None or model.blob_path is None:
+        return ()
+    return (
+        OllamaArtifact(
+            role=ArtifactRole.MODEL,
+            media_type="application/vnd.ollama.image.model",
+            digest=model.model_digest,
+            blob_path=model.blob_path,
+            declared_size=model.declared_size,
+            blob_size=model.blob_size,
+            gguf_valid=model.gguf_valid,
+            manifest_index=0,
+            issues=model.issues,
+        ),
     )
-    actual = tuple((artifact.role, artifact.digest) for artifact in record.artifacts)
-    if actual != expected:
+
+
+def is_synced(
+    model: OllamaModel, record: SyncRecord | None, models_dir: Path | None = None
+) -> bool:
+    """A saved digest is insufficient: every imported file must still work.
+
+    An import whose Ollama blob has since gone missing still counts while the
+    file is verifiably the one StudioLink created; it needs nothing from Ollama.
+    """
+    from studiolink.files import artifact_destination, intact_destination
+
+    if record is None or model.readiness is ModelReadiness.INVALID:
         return False
-    if any(role is ArtifactRole.PROJECTOR for role, _ in expected):
-        if not record.vision_confirmed:
-            return False
-    for artifact in record.artifacts:
-        target = artifact.imported_model_path
-        if artifact.role is ArtifactRole.MODEL and target is None:
-            target = expected_target
-        if target is None:
-            if artifact.role is ArtifactRole.PROJECTOR:
+    sources = model_artifacts(model)
+    expected = tuple((artifact.role, artifact.digest) for artifact in sources)
+    actual = tuple((artifact.role, artifact.digest) for artifact in record.artifacts)
+    if not sources or actual != expected:
+        return False
+    if len(sources) > 1 and not record.vision_confirmed:
+        return False
+    try:
+        for source, artifact in zip(sources, record.artifacts):
+            target = (
+                artifact_destination(record, artifact, models_dir)
+                if models_dir
+                else artifact.imported_model_path
+            )
+            if target is None or not intact_destination(
+                target, source, record.link_mode, artifact
+            ):
                 return False
-            continue
-        if not target.is_file():
-            return False
+    except (OSError, ValueError):
+        return False
     return True
 
 
@@ -401,10 +443,12 @@ class PruneReport:
     dry_run: bool
     aliases: tuple[PruneResult, ...] = ()
     records_removed: tuple[str, ...] = ()
+    imports: tuple[PruneResult, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
             "dry_run": self.dry_run,
             "aliases": [item.to_json() for item in self.aliases],
+            "imports": [item.to_json() for item in self.imports],
             "records_removed": list(self.records_removed),
         }

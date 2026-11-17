@@ -419,11 +419,11 @@ class TestDryRun:
         results = syncer.sync([model], **sync_kwargs(dry_run=True))
 
         assert results[0].status == "dry-run"
-        assert fake.calls[0]["dry_run"] is True
+        assert fake.calls == []
         assert not (config.import_staging_dir / model.import_filename).exists()
         assert StateStore(config.state_file).get_all_records() == {}
 
-    def test_dry_run_failure_still_cleans_alias(self, make_syncer):
+    def test_dry_run_does_not_need_working_lms(self, make_syncer):
         syncer, config, fake = make_syncer()
         write_manifest(config, digest=DIGEST_A)
         write_blob(config, DIGEST_A)
@@ -432,7 +432,7 @@ class TestDryRun:
 
         results = syncer.sync([model], **sync_kwargs(dry_run=True))
 
-        assert results[0].status == "error"
+        assert results[0].status == "dry-run"
         assert not (config.import_staging_dir / model.import_filename).exists()
 
 
@@ -593,6 +593,25 @@ class TestReadinessOfSyncedModels:
         assert results[0].model.readiness is ModelReadiness.READY
 
 
+def test_failed_alias_replacement_preserves_previous_link(make_syncer, monkeypatch):
+    syncer, config, _ = make_syncer()
+    write_manifest(config)
+    blob = write_blob(config, DIGEST_A)
+    model = scan_models(config)[0]
+    alias, _ = _ensure_import_alias(model, config.import_staging_dir)
+    old_inode = alias.stat().st_ino
+    blob.unlink()
+    write_blob(config, DIGEST_A)
+
+    def denied(*args, **kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(os, "link", denied)
+    result = syncer.sync(scan_models(config), **sync_kwargs())
+    assert result[0].status == "error"
+    assert alias.stat().st_ino == old_inode
+
+
 class TestAliasFilesystemErrors:
     def test_blocked_staging_dir_is_per_model_error(self, make_syncer):
         # Regression: PermissionError/FileExistsError from mkdir() or the
@@ -611,9 +630,11 @@ class TestAliasFilesystemErrors:
         assert all("import alias" in result.message for result in results)
         assert fake.calls == []
 
-    def test_stale_alias_unlink_failure_is_per_model_error(
+    def test_stale_alias_replacement_failure_is_per_model_error(
         self, make_syncer, monkeypatch
     ):
+        # Stale aliases are replaced atomically rather than unlinked first, so
+        # the failure point is the replace; it must still stay per-model.
         syncer, config, fake = make_syncer()
         write_manifest(config, digest=DIGEST_A)
         write_blob(config, DIGEST_A)
@@ -622,18 +643,20 @@ class TestAliasFilesystemErrors:
         stale = config.import_staging_dir / model.import_filename
         stale.write_bytes(b"stale content")
 
-        def denied(path, *args, **kwargs):
-            if path == stale:
+        def denied(source, target, *args, **kwargs):
+            if Path(target) == stale:
                 raise PermissionError(1, "Operation not permitted")
-            return real_unlink(path, *args, **kwargs)
+            return real_replace(source, target, *args, **kwargs)
 
-        real_unlink = Path.unlink
-        monkeypatch.setattr(Path, "unlink", denied)
+        real_replace = os.replace
+        monkeypatch.setattr(syncer_module.os, "replace", denied)
 
         result = syncer.sync([model], **sync_kwargs())[0]
 
         assert result.status == "error"
-        assert "stale import alias" in result.message
+        assert "import alias" in result.message
+        assert stale.read_bytes() == b"stale content"
+        assert fake.calls == []
 
     def test_zero_inode_files_never_compare_equal(self, tmp_path, monkeypatch):
         # Filesystems without file ids (FAT/exFAT) report st_ino == 0 for
@@ -660,7 +683,7 @@ class TestAliasFilesystemErrors:
         assert same_file(left, left) is False
 
 
-def write_bundle(config, model_digest, projector_digest, *, model_first):
+def write_bundle(config, model_digest, projector_digest, *, model_first, tag="1b"):
     layers = [
         {"mediaType": "application/vnd.ollama.image.model", "digest": model_digest},
         {
@@ -670,7 +693,7 @@ def write_bundle(config, model_digest, projector_digest, *, model_first):
     ]
     if not model_first:
         layers.reverse()
-    write_manifest(config, repository="llava", content={"layers": layers})
+    write_manifest(config, repository="llava", tag=tag, content={"layers": layers})
 
 
 class TestProjectorFirstManifests:
@@ -802,3 +825,103 @@ class TestBundleCoLocation:
 
         assert result.status == "skipped"
         assert len(fake.calls) == 2
+
+
+class TestBundleLifecycle:
+    """Verified imports, reclamation and copy reuse apply to every artifact."""
+
+    PROJECTOR = "sha256:" + "c" * 64
+    NEW_PROJECTOR = "sha256:" + "d" * 64
+
+    def synced_bundle(self, make_syncer, **kwargs):
+        syncer, config, fake = make_syncer()
+        write_bundle(config, DIGEST_A, self.PROJECTOR, model_first=True)
+        write_blob(config, DIGEST_A)
+        write_blob(config, self.PROJECTOR)
+        first = syncer.sync(scan_models(config), **sync_kwargs(**kwargs))[0]
+        assert first.status == "synced"
+        assert first.record is not None
+        return syncer, config, fake, first.record
+
+    def test_repull_reclaims_previous_bundle(self, make_syncer):
+        syncer, config, _, old = self.synced_bundle(make_syncer)
+        old_projector_blob = config.ollama_blobs_dir / blob_filename(self.PROJECTOR)
+        write_blob(config, self.NEW_PROJECTOR)
+        write_bundle(config, DIGEST_A, self.NEW_PROJECTOR, model_first=True)
+
+        result = syncer.sync(scan_models(config), **sync_kwargs())[0]
+
+        assert result.status == "synced"
+        for artifact in old.artifacts:
+            assert artifact.imported_model_path is not None
+            assert not artifact.imported_model_path.exists()
+        projector_alias = old.artifacts[1].import_alias_path
+        assert not projector_alias.exists()
+        assert old_projector_blob.stat().st_nlink == 1
+
+    def test_failed_repull_keeps_previous_bundle_tracked(self, make_syncer):
+        syncer, config, fake, old = self.synced_bundle(make_syncer)
+        write_blob(config, self.NEW_PROJECTOR)
+        write_bundle(config, DIGEST_A, self.NEW_PROJECTOR, model_first=True)
+        model = scan_models(config)[0]
+        new_alias = config.import_staging_dir / model.artifact_import_filename(
+            model.artifacts[1]
+        )
+        fake.fail_for = {str(new_alias)}
+
+        failed = syncer.sync([model], **sync_kwargs())[0]
+
+        assert failed.status == "error"
+        assert StateStore(config.state_file).get_record("llava:1b") == old
+        assert all(
+            artifact.imported_model_path is not None
+            and artifact.imported_model_path.is_file()
+            for artifact in old.artifacts
+        )
+
+        fake.fail_for.clear()
+        retried = syncer.sync([model], **sync_kwargs())[0]
+
+        assert retried.status == "synced"
+        # The model imported by the failed attempt is verified and adopted.
+        assert [call["source_path"] for call in fake.calls[4:]] == [str(new_alias)]
+        assert not any(
+            artifact.imported_model_path is not None
+            and artifact.imported_model_path.exists()
+            for artifact in old.artifacts
+        )
+
+    def test_copy_bundle_tags_share_copies(self, make_syncer):
+        syncer, config, fake, first = self.synced_bundle(
+            make_syncer, link_mode=LinkMode.COPY
+        )
+        write_bundle(config, DIGEST_A, self.PROJECTOR, model_first=True, tag="2b")
+        second_model = next(model for model in scan_models(config) if model.tag == "2b")
+
+        second = syncer.sync([second_model], **sync_kwargs(link_mode=LinkMode.COPY))[0]
+
+        assert second.status == "synced"
+        assert len(fake.calls) == 2
+        assert second.record is not None
+        for left, right in zip(first.artifacts, second.record.artifacts):
+            assert left.imported_model_path is not None
+            assert right.imported_model_path is not None
+            assert left.imported_model_path != right.imported_model_path
+            assert same_file(left.imported_model_path, right.imported_model_path)
+            assert not same_file(right.imported_model_path, right.blob_path)
+
+    def test_changed_projector_file_is_not_skipped(self, make_syncer):
+        syncer, config, fake, record = self.synced_bundle(
+            make_syncer, link_mode=LinkMode.COPY
+        )
+        projector = record.artifacts[1].imported_model_path
+        assert projector is not None
+        projector.write_bytes(b"GGUFtampered")
+
+        result = syncer.sync(
+            scan_models(config), **sync_kwargs(link_mode=LinkMode.COPY)
+        )[0]
+
+        assert result.status == "error"
+        assert "not verified" in result.message
+        assert projector.read_bytes() == b"GGUFtampered"
