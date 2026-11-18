@@ -3,7 +3,7 @@
 All notable changes to StudioLink are documented here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-11-18
 
 ### ⚠️ Behavior changes — read before upgrading
 
