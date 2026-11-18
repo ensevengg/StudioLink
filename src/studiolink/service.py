@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from studiolink.config import StudioLinkConfig
-from studiolink.files import artifact_destination, owns_destination, symlink_references
+from studiolink.files import (
+    artifact_destination,
+    choose_link_mode,
+    owns_destination,
+    remove_empty_parents,
+    symlink_references,
+)
 from studiolink.lmstudio_adapter import LMStudioAdapter, LMStudioError
 from studiolink.models import (
     ArtifactRole,
@@ -144,8 +150,21 @@ class StudioLinkService:
             )
 
         mode = link_mode or self.config.default_link_mode
+        automatic = mode is None
+        if mode is None:
+            mode, reason = self.default_link_mode()
+            logger.debug("Automatic link mode: %s (%s)", mode, reason)
         syncer = Syncer(self.config, self.lmstudio, self.state)
-        return syncer.sync(selected, mode, import_mode, dry_run)
+        return syncer.sync(
+            selected, mode, import_mode, dry_run, keep_existing_mode=automatic
+        )
+
+    def default_link_mode(self) -> tuple[LinkMode, str]:
+        """The mode sync uses without a flag, and why."""
+        return choose_link_mode(
+            self._any_blob_file(),
+            [self.config.import_staging_dir, self.config.lmstudio_models_dir],
+        )
 
     def prune(self, *, dry_run: bool = False) -> PruneReport:
         """Remove obsolete managed destinations as well as their staging aliases."""
@@ -245,6 +264,7 @@ class StudioLinkService:
                 try:
                     path.unlink()
                     removed = True
+                    remove_empty_parents(path, root)
                 except OSError as exc:
                     error = exc
                     logger.warning("Could not remove %s: %s", path, exc)
@@ -373,8 +393,7 @@ class StudioLinkService:
                 self.config.lmstudio_models_dir.exists(),
                 str(self.config.lmstudio_models_dir),
             ),
-            self._volume_compatibility_check(),
-            self._hard_link_permission_check(),
+            self._link_mode_check(),
         ]
 
         try:
@@ -467,78 +486,27 @@ class StudioLinkService:
 
         return checks
 
-    def _volume_compatibility_check(self) -> DoctorCheck:
-        """Check that hard links can span blobs -> staging -> LM Studio models.
+    def _link_mode_check(self) -> DoctorCheck:
+        """Report which import mode sync will use without a flag.
 
-        Compares filesystem device ids, which works on both Windows (volume
-        serial) and POSIX (st_dev); drive letters alone are meaningless on
-        Linux.
+        Probes real links (into directories not created yet via their nearest
+        existing parent), so a first run on a btrfs subvolume layout or with
+        fs.protected_hardlinks is caught before any sync fails.
         """
-        targets = [
-            ("ollama blobs", self.config.ollama_blobs_dir),
-            ("import staging", self.config.import_staging_dir),
-            ("lm studio models", self.config.lmstudio_models_dir),
-        ]
-        devices: dict[str, int] = {}
-        for label, path in targets:
-            if not path.exists():
-                return DoctorCheck(
-                    "hard-link volume compatibility",
-                    True,
-                    f"skipped: {label} directory does not exist yet ({path})",
-                )
-            devices[label] = os.stat(path).st_dev
-        ok = len(set(devices.values())) == 1
-        details = ", ".join(
-            f"{label}: device {device}" for label, device in devices.items()
-        )
-        return DoctorCheck("hard-link volume compatibility", ok, details)
-
-    def _hard_link_permission_check(self) -> DoctorCheck:
-        """Probe that a real blob can actually be hard-linked into staging.
-
-        Same-volume checks (st_dev) cannot catch policies such as Linux
-        fs.protected_hardlinks, which blocks linking a blob the user cannot
-        write - the typical layout when Ollama runs as a system service. The
-        probe links a real blob under a temporary name and removes it again.
-        """
-        name = "hard-link permission on blobs"
-        blob = self._any_blob_file()
-        if blob is None:
-            return DoctorCheck(name, True, "skipped: no blobs present")
-        destinations = list(
-            dict.fromkeys(
-                [
-                    self.config.import_staging_dir,
-                    self.config.ollama_models_dir / ".studiolink-imports",
-                ]
+        name = "default link mode"
+        if self.config.default_link_mode is not None:
+            return DoctorCheck(
+                name, True, f"{self.config.default_link_mode} (configured)"
             )
+        mode, reason = self.default_link_mode()
+        if mode is LinkMode.HARD_LINK:
+            return DoctorCheck(name, True, f"{mode}: {reason}")
+        return DoctorCheck(
+            name,
+            True,
+            f"{mode}: {reason}. Sync uses {mode} automatically; "
+            "--hard-link would fail on this machine",
         )
-        outcomes: list[str] = []
-        ok = True
-        for destination in destinations:
-            if not destination.is_dir():
-                outcomes.append(f"{destination}: skipped (not created yet)")
-                continue
-            probe = destination / f".studiolink-probe-{os.getpid()}"
-            try:
-                probe.unlink(missing_ok=True)
-                os.link(blob, probe)
-            except OSError as exc:
-                ok = False
-                outcomes.append(
-                    f"{destination}: FAILED ({exc}); blobs must be linkable "
-                    "here - on Linux check blob ownership and "
-                    "fs.protected_hardlinks, or use --copy"
-                )
-            else:
-                outcomes.append(f"{destination}: ok")
-            finally:
-                try:
-                    probe.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        return DoctorCheck(name, ok, "; ".join(outcomes))
 
     def _any_blob_file(self) -> Path | None:
         blobs = self.config.ollama_blobs_dir

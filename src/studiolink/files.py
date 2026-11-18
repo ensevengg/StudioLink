@@ -168,6 +168,18 @@ def intact_destination(
         return False
 
 
+def remove_empty_parents(path: Path, root: Path) -> None:
+    """Remove the now-empty repository folders an import lived in, below ``root``."""
+    root = root.absolute()
+    parent = path.absolute().parent
+    while parent != root and root in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+        parent = parent.parent
+
+
 def remove_import(
     record: SyncRecord, root: Path, staging: Path, *, keep: set[Path]
 ) -> None:
@@ -179,6 +191,7 @@ def remove_import(
                     f"Refusing to remove a changed or unverified import: {path}"
                 )
             path.unlink()
+            remove_empty_parents(path, root)
     references = symlink_references(root)
     for artifact in record.artifacts:
         alias = artifact.import_alias_path
@@ -200,3 +213,73 @@ def symlink_references(root: Path) -> dict[Path, set[Path]]:
             if path.is_symlink():
                 references.setdefault(link_target(path), set()).add(path)
     return references
+
+
+def existing_ancestor(path: Path) -> Path:
+    """The nearest directory that exists, where a probe stands in for ``path``."""
+    path = path.absolute()
+    while not path.is_dir() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def _probe(directory: Path, create) -> OSError | None:
+    probe = existing_ancestor(directory) / f".studiolink-probe-{os.getpid()}"
+    try:
+        probe.unlink(missing_ok=True)
+        create(probe)
+    except OSError as exc:
+        return exc
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return None
+
+
+def probe_hard_link(source: Path, directory: Path) -> OSError | None:
+    """Try hard-linking ``source`` into ``directory`` (or the ancestor it will be created in).
+
+    A real link catches what device ids cannot: btrfs subvolumes and bind
+    mounts on one disk, and Linux fs.protected_hardlinks on blobs owned by the
+    ``ollama`` service user.
+    """
+    return _probe(directory, lambda probe: os.link(source, probe))
+
+
+def probe_symlink(source: Path, directory: Path) -> OSError | None:
+    """Try creating a symlink to ``source`` (Windows needs Developer Mode)."""
+    return _probe(directory, lambda probe: probe.symlink_to(source.absolute()))
+
+
+def choose_link_mode(
+    source: Path | None, directories: list[Path]
+) -> tuple[LinkMode, str]:
+    """Pick the cheapest import mode that works from ``source`` into ``directories``.
+
+    Hard links cost no space and survive Ollama deleting the blob; symlinks
+    cost no space but break if the blob goes; copies always work.
+    """
+    from studiolink.models import LinkMode
+
+    if source is None:
+        return LinkMode.HARD_LINK, "no Ollama blobs to probe yet"
+    failures = [
+        f"{directory}: {exc.strerror or exc}"
+        for directory in directories
+        if (exc := probe_hard_link(source, directory)) is not None
+    ]
+    if not failures:
+        return LinkMode.HARD_LINK, "hard links work"
+    reason = "hard links unavailable (" + "; ".join(failures) + ")"
+    symlink_failure = next(
+        (exc for directory in directories if (exc := probe_symlink(source, directory))),
+        None,
+    )
+    if symlink_failure is None:
+        return LinkMode.SYMBOLIC_LINK, reason
+    return (
+        LinkMode.COPY,
+        f"{reason}; symlinks unavailable ({symlink_failure.strerror or symlink_failure})",
+    )

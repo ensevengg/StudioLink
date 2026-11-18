@@ -26,7 +26,14 @@ All notable changes to StudioLink are documented here. Versions follow
   land together in LM Studio.
 - `sdl sync <model> --direct` to import a single-file model without a
   human-readable alias.
-- `sdl doctor` checks hard-link permission and LM Studio model inventory
+- Automatic link mode: without `--hard-link`, `--symbolic-link` or `--copy`,
+  sync uses hard links when they work, otherwise symbolic links, otherwise
+  copies, and says which it picked. Already-synced models keep their mode.
+- Linux: finds Ollama's model store for the official installer, distro
+  packages (`/var/lib/ollama` on Arch/CachyOS), a relocation set in the
+  `ollama` systemd unit, and `~/.ollama/models`.
+- `sdl doctor` reports the link mode sync will use, probing real links even
+  before StudioLink's directories exist, and checks LM Studio model inventory
   (`lms ls --json`).
 
 ### Fixed
@@ -37,6 +44,10 @@ All notable changes to StudioLink are documented here. Versions follow
 - Identical model files shared by several Ollama tags are reused.
 - Ollama blobs are validated and incomplete scans are reported.
 - Symlinked imports and the hard-link fallback work on Windows.
+- Symbolic-link and copy modes work when hard links are blocked by
+  `fs.protected_hardlinks` or a read-only Ollama store (Linux system service).
+- `--hard-link` failures explain why and suggest another mode.
+- Prune removes the empty LM Studio folders an import leaves behind.
 - `status` degrades gracefully when a library is unavailable; state writes are
   durable and tolerate a UTF-8 BOM.
 

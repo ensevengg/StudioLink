@@ -68,6 +68,8 @@ class Syncer:
         link_mode: LinkMode,
         import_mode: ImportMode,
         dry_run: bool,
+        *,
+        keep_existing_mode: bool = False,
     ) -> list[SyncResult]:
         logger.debug(
             "Syncing %d model(s): link_mode=%s, import_mode=%s, dry_run=%s",
@@ -77,7 +79,9 @@ class Syncer:
             dry_run,
         )
         with self.state.lock():
-            return self._sync_locked(models, link_mode, import_mode, dry_run)
+            return self._sync_locked(
+                models, link_mode, import_mode, dry_run, keep_existing_mode
+            )
 
     def _sync_locked(
         self,
@@ -85,6 +89,7 @@ class Syncer:
         link_mode: LinkMode,
         import_mode: ImportMode,
         dry_run: bool,
+        keep_existing_mode: bool = False,
     ) -> list[SyncResult]:
         if not dry_run:
             recover_imports(self.config.lmstudio_models_dir)
@@ -92,8 +97,18 @@ class Syncer:
         logger.debug("Loaded %d existing sync record(s)", len(records))
         results: list[SyncResult] = []
         for model in models:
+            mode = link_mode
+            existing = records.get(model.canonical_name)
+            if (
+                keep_existing_mode
+                and existing is not None
+                and is_synced(model, existing, self.config.lmstudio_models_dir)
+            ):
+                # Without an explicit flag, a working import keeps its mode
+                # instead of being converted to whatever the probe picked.
+                mode = existing.link_mode
             try:
-                result = self._sync_one(model, records, link_mode, import_mode, dry_run)
+                result = self._sync_one(model, records, mode, import_mode, dry_run)
             except (OSError, RuntimeError, ValueError) as exc:
                 result = SyncResult(model=model, status="error", message=str(exc))
             results.append(result)
@@ -539,7 +554,16 @@ class Syncer:
             # The alias controls the human-readable LM Studio filename. Keep
             # this temporary hard link on the Ollama filesystem so copy mode
             # still works when StudioLink state lives on another volume.
-            staging = self.config.ollama_models_dir / ".studiolink-imports"
+            beside_blobs = self.config.ollama_models_dir / ".studiolink-imports"
+            try:
+                return _ensure_import_alias(model, beside_blobs, link_mode, artifact)
+            except RuntimeError as exc:
+                # A system-service store (owned by the "ollama" user) is
+                # read-only to us; a symlink alias in our own staging works,
+                # since LM Studio copies the file it resolves to.
+                logger.debug(
+                    "Copy alias beside blobs failed (%s); using %s", exc, staging
+                )
         return _ensure_import_alias(model, staging, link_mode, artifact)
 
 
@@ -594,9 +618,18 @@ def _ensure_import_alias(
         try:
             os.link(blob_path, temporary)
         except OSError as exc:
-            if exc.errno != errno.EXDEV or link_mode is LinkMode.HARD_LINK:
+            if not (exc.errno == errno.EXDEV or hardlinks_unsupported(exc)):
                 raise
-            # Stage across volumes without writing another full copy.
+            if link_mode is LinkMode.HARD_LINK:
+                raise RuntimeError(
+                    f"Failed to create import alias: {exc}. Hard links are not "
+                    "possible here (another filesystem or btrfs subvolume, or a "
+                    "blob owned by another user under fs.protected_hardlinks); "
+                    "use --symbolic-link or --copy, or omit the flag to choose "
+                    "automatically"
+                ) from exc
+            # Stage across volumes, or around fs.protected_hardlinks, without
+            # writing another full copy.
             temporary.symlink_to(blob_path.resolve())
         if present:
             os.replace(temporary, alias_path)

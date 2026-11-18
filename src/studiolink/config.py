@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +17,68 @@ def _expand_path(env_name: str, default: Path) -> Path:
     return Path(raw).expanduser() if raw else default.expanduser()
 
 
+# Where Linux Ollama installs keep models: the official install script runs the
+# service as the "ollama" user with HOME=/usr/share/ollama, distro packages
+# (Arch, CachyOS) set OLLAMA_MODELS=/var/lib/ollama, and a manually started
+# `ollama serve` uses the invoking user's home.
+LINUX_OLLAMA_MODELS_DIRS = (
+    Path("/usr/share/ollama/.ollama/models"),
+    Path("/var/lib/ollama"),
+)
+
+
+def _systemd_ollama_models_dir() -> Path | None:
+    """Read OLLAMA_MODELS from the ollama systemd unit, if one sets it.
+
+    The service's environment is invisible to the user's shell, so a
+    relocated store would otherwise go unnoticed.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                "ollama.service",
+                "--property=Environment",
+                "--value",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        entries = shlex.split(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    for entry in entries:
+        name, _, value = entry.partition("=")
+        if name == "OLLAMA_MODELS" and value:
+            return Path(value)
+    return None
+
+
+def _has_ollama_store(path: Path) -> bool:
+    return any(
+        (path / name).is_dir() for name in ("manifests-v2", "manifests", "blobs")
+    )
+
+
 def _default_ollama_models_dir(home: Path) -> Path:
-    if sys.platform.startswith("linux"):
-        return Path("/usr/share/ollama/.ollama/models")
-    return home / ".ollama" / "models"
+    if not sys.platform.startswith("linux"):
+        return home / ".ollama" / "models"
+    service_dir = _systemd_ollama_models_dir()
+    candidates = [
+        *([service_dir] if service_dir is not None else []),
+        *LINUX_OLLAMA_MODELS_DIRS,
+        home / ".ollama" / "models",
+    ]
+    for candidate in candidates:
+        try:
+            if _has_ollama_store(candidate):
+                return candidate
+        except OSError:
+            continue
+    return candidates[0]
 
 
 def _default_ollama_exe(home: Path) -> Path:
@@ -62,7 +122,8 @@ class StudioLinkConfig:
     state_dir: Path
     state_file: Path
     import_staging_dir: Path
-    default_link_mode: LinkMode = LinkMode.HARD_LINK
+    # None picks the cheapest mode this machine supports (files.choose_link_mode).
+    default_link_mode: LinkMode | None = None
     # Ollama 0.40+ writes named manifests to manifests-v2/; None derives it
     # from ollama_models_dir.
     ollama_manifests_v2_dir: Path | None = None

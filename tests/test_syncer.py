@@ -385,6 +385,92 @@ class TestCrossVolumeCopy:
         assert not alias.exists()
 
 
+class TestHardLinksUnavailable:
+    """Linux system-service installs: btrfs subvolumes or fs.protected_hardlinks."""
+
+    def deny_links(self, monkeypatch, error):
+        def denied(source, target, *args, **kwargs):
+            raise OSError(error, os.strerror(error))
+
+        monkeypatch.setattr("studiolink.syncer.os.link", denied)
+
+    def test_symlink_mode_survives_protected_hardlinks(self, make_syncer, monkeypatch):
+        syncer, config, _ = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        model = scan_models(config)[0]
+        self.deny_links(monkeypatch, errno.EPERM)
+
+        result = syncer.sync([model], **sync_kwargs(link_mode=LinkMode.SYMBOLIC_LINK))[
+            0
+        ]
+
+        assert result.status == "synced", result.message
+        alias = config.import_staging_dir / model.import_filename
+        assert alias.is_symlink() and same_file(alias, model.blob_path)
+
+    def test_explicit_hard_link_failure_suggests_alternatives(
+        self, make_syncer, monkeypatch
+    ):
+        syncer, config, fake = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        self.deny_links(monkeypatch, errno.EXDEV)
+
+        result = syncer.sync(scan_models(config), **sync_kwargs())[0]
+
+        assert result.status == "error"
+        assert "--symbolic-link" in result.message
+        assert "omit the flag" in result.message
+        assert fake.calls == []
+
+    def test_copy_falls_back_when_ollama_store_is_read_only(
+        self, make_syncer, monkeypatch
+    ):
+        syncer, config, _ = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        model = scan_models(config)[0]
+        beside_blobs = config.ollama_models_dir / ".studiolink-imports"
+        real_mkdir = Path.mkdir
+
+        def read_only_store(self, *args, **kwargs):
+            if self == beside_blobs:
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            return real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", read_only_store)
+        self.deny_links(monkeypatch, errno.EXDEV)
+
+        result = syncer.sync([model], **sync_kwargs(link_mode=LinkMode.COPY))[0]
+
+        assert result.status == "synced", result.message
+        target = result.record.imported_model_path
+        assert target.is_file() and not target.is_symlink()
+        assert not same_file(target, model.blob_path)
+        assert not beside_blobs.exists()
+        assert not (config.import_staging_dir / model.import_filename).exists()
+
+    def test_automatic_mode_keeps_a_working_import(self, make_syncer):
+        syncer, config, fake = make_syncer()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        models = scan_models(config)
+        syncer.sync(models, **sync_kwargs(link_mode=LinkMode.SYMBOLIC_LINK))
+        calls = len(fake.calls)
+
+        result = syncer.sync(
+            models, **sync_kwargs(link_mode=LinkMode.HARD_LINK), keep_existing_mode=True
+        )[0]
+
+        assert result.status == "skipped"
+        assert len(fake.calls) == calls
+        assert (
+            StateStore(config.state_file).get_record(models[0].canonical_name).link_mode
+            is LinkMode.SYMBOLIC_LINK
+        )
+
+
 class TestUnreadyModels:
     def test_stale_blob_errors_with_pull_hint(self, make_syncer):
         syncer, config, fake = make_syncer()

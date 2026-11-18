@@ -1,6 +1,9 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 import studiolink.config as config_module
 from studiolink.config import StudioLinkConfig
@@ -138,10 +141,11 @@ class TestPlatformDefaults:
     def test_linux_default_models_dirs(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        _hide_linux_stores(monkeypatch, tmp_path)
 
         config = StudioLinkConfig.from_env()
 
-        assert config.ollama_models_dir == Path("/usr/share/ollama/.ollama/models")
+        assert config.ollama_models_dir == tmp_path / "official"
         assert config.lmstudio_models_dir == tmp_path / ".lmstudio" / "models"
         assert config.state_dir == tmp_path / ".studiolink"
 
@@ -152,3 +156,81 @@ class TestPlatformDefaults:
         config = StudioLinkConfig.from_env()
 
         assert config.ollama_models_dir == tmp_path / ".ollama" / "models"
+
+
+def _hide_linux_stores(monkeypatch, tmp_path, service_dir=None):
+    """Point Linux detection at empty fakes instead of the host's real Ollama."""
+    monkeypatch.setattr(
+        config_module,
+        "LINUX_OLLAMA_MODELS_DIRS",
+        (tmp_path / "official", tmp_path / "var-lib-ollama"),
+    )
+    monkeypatch.setattr(
+        config_module, "_systemd_ollama_models_dir", lambda: service_dir
+    )
+
+
+class TestLinuxOllamaStoreDetection:
+    @pytest.fixture(autouse=True)
+    def linux(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+
+    def test_finds_distro_package_store(self, monkeypatch, tmp_path):
+        # Arch/CachyOS: OLLAMA_MODELS=/var/lib/ollama, manifests directly inside.
+        _hide_linux_stores(monkeypatch, tmp_path)
+        (tmp_path / "var-lib-ollama" / "manifests-v2").mkdir(parents=True)
+
+        assert (
+            StudioLinkConfig.from_env().ollama_models_dir == tmp_path / "var-lib-ollama"
+        )
+
+    def test_prefers_official_install_when_both_exist(self, monkeypatch, tmp_path):
+        _hide_linux_stores(monkeypatch, tmp_path)
+        (tmp_path / "official" / "blobs").mkdir(parents=True)
+        (tmp_path / "var-lib-ollama" / "manifests").mkdir(parents=True)
+
+        assert StudioLinkConfig.from_env().ollama_models_dir == tmp_path / "official"
+
+    def test_finds_user_store_from_manual_ollama_serve(self, monkeypatch, tmp_path):
+        _hide_linux_stores(monkeypatch, tmp_path)
+        user_store = tmp_path / "home" / ".ollama" / "models"
+        (user_store / "manifests").mkdir(parents=True)
+
+        assert StudioLinkConfig.from_env().ollama_models_dir == user_store
+
+    def test_systemd_unit_relocation_wins(self, monkeypatch, tmp_path):
+        relocated = tmp_path / "data" / "ollama"
+        (relocated / "blobs").mkdir(parents=True)
+        (tmp_path / "official" / "blobs").mkdir(parents=True)
+        _hide_linux_stores(monkeypatch, tmp_path, service_dir=relocated)
+
+        assert StudioLinkConfig.from_env().ollama_models_dir == relocated
+
+    def test_user_ollama_models_env_still_wins(self, monkeypatch, tmp_path):
+        (tmp_path / "var-lib-ollama" / "blobs").mkdir(parents=True)
+        _hide_linux_stores(monkeypatch, tmp_path)
+        monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path / "mine"))
+
+        assert StudioLinkConfig.from_env().ollama_models_dir == tmp_path / "mine"
+
+
+class TestSystemdOllamaModels:
+    def run_with(self, monkeypatch, stdout=None, error=None):
+        def fake_run(*args, **kwargs):
+            if error is not None:
+                raise error
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(config_module.subprocess, "run", fake_run)
+        return config_module._systemd_ollama_models_dir()
+
+    def test_reads_ollama_models_from_unit_environment(self, monkeypatch):
+        stdout = 'HOME=/var/lib/ollama "OLLAMA_MODELS=/srv/my models"\n'
+        assert self.run_with(monkeypatch, stdout) == Path("/srv/my models")
+
+    def test_unit_without_relocation(self, monkeypatch):
+        assert self.run_with(monkeypatch, "HOME=/usr/share/ollama\n") is None
+
+    def test_no_systemctl(self, monkeypatch):
+        assert self.run_with(monkeypatch, error=FileNotFoundError("systemctl")) is None

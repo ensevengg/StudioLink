@@ -47,6 +47,11 @@ class FakeService:
             raise ValueError("provide at least one model name or use --all")
         return [SyncResult(model=self._model, status="synced", message="ok")]
 
+    automatic_mode = (LinkMode.HARD_LINK, "hard links work")
+
+    def default_link_mode(self):
+        return self.automatic_mode
+
     def doctor(self):
         self.calls.append(("doctor",))
         return [DoctorCheck("demo check", True, "all good")]
@@ -178,6 +183,26 @@ class TestSyncCommand:
 
         monkeypatch.setattr(fake_service, "sync", failing_sync)
         assert cli.main(["sync", "llama3:1b"]) == 1
+
+    def test_sync_announces_automatic_fallback(self, fake_service, capsys):
+        fake_service.automatic_mode = (
+            LinkMode.SYMBOLIC_LINK,
+            "hard links unavailable (x: Invalid cross-device link)",
+        )
+        assert cli.main(["sync", "llama3:1b"]) == 0
+        text = out(capsys)
+        assert "Using symbolic-link for new imports" in text
+        assert "cross-device" in text
+        assert fake_service.calls[-1][3] is None
+
+    def test_sync_is_quiet_when_hard_links_work(self, fake_service, capsys):
+        assert cli.main(["sync", "llama3:1b"]) == 0
+        assert "Using" not in out(capsys)
+
+    def test_explicit_mode_skips_announcement(self, fake_service, capsys):
+        fake_service.automatic_mode = (LinkMode.COPY, "nothing links")
+        assert cli.main(["sync", "llama3:1b", "--hard-link"]) == 0
+        assert "Using" not in out(capsys)
 
 
 class TestJsonOutput:

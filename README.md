@@ -2,7 +2,7 @@
 
 **Sync Ollama-downloaded GGUF models into LM Studio.**
 
-StudioLink is a Python CLI tool that bridges Ollama and LM Studio. It treats Ollama as the source of truth, discovers GGUF-backed models from Ollama manifests, and imports them into LM Studio via the `lms` CLI—using hard links by default to save disk space.
+StudioLink is a Python CLI tool that bridges Ollama and LM Studio. It treats Ollama as the source of truth, discovers GGUF-backed models from Ollama manifests, and imports them into LM Studio via the `lms` CLI—using hard links when the filesystem allows them, and symbolic links otherwise, to save disk space.
 
 ## Features
 
@@ -11,14 +11,14 @@ StudioLink is a Python CLI tool that bridges Ollama and LM Studio. It treats Oll
 - 📊 **Status** - Track which models are synced and their current state
 - 🩺 **Doctor** - Verify prerequisites and diagnose issues
 - 🧹 **Prune** - Remove obsolete managed imports and aliases to release pinned disk space
-- 🔗 **Smart linking** - Uses hard links by default; pass `--copy` when volumes differ
+- 🔗 **Smart linking** - Uses hard links when possible and switches to symbolic links (or copies) automatically when they aren't, e.g. across volumes or btrfs subvolumes
 - 💾 **State tracking** - Remembers what's been synced to avoid re-importing
 
 ## Prerequisites
 
 Before using StudioLink, ensure you have:
 
-1. **Ollama** installed with a local model library (StudioLink detects platform defaults and honors `OLLAMA_MODELS`)
+1. **Ollama** installed with a local model library (StudioLink detects platform defaults, including Linux system-service and distro-package stores, and honors `OLLAMA_MODELS`)
 2. **LM Studio** with the `lms` CLI installed
 3. **Python 3.12+**
 
@@ -110,9 +110,11 @@ sdl -v sync --all
 **Options:**
 - `--all` - Sync every discovered model
 - `--dry-run` - Preview the import without making changes
-- `--copy` - Use copy mode instead of hard links
-- `--hard-link` - Force hard link mode (default)
+- `--copy` - Copy the weights (uses disk space, but keeps working if Ollama deletes the model)
+- `--hard-link` - Force hard links; fails if they are not possible
 - `--symbolic-link` - Use symbolic links
+
+Without a mode flag, sync probes the machine and uses hard links if they work, otherwise symbolic links, otherwise copies, and prints which mode it picked. Models that are already synced keep the mode they were imported with.
 - `--direct` - Import a single-artifact Ollama blob directly without a human-readable alias; model-plus-projector bundles require aliases
 
 ### `sdl status`
@@ -163,8 +165,7 @@ sdl doctor --json
 - LM Studio CLI (`lms`) exists
 - Ollama manifests (`manifests-v2/` from Ollama 0.40+, or legacy `manifests/`) and blobs directories exist
 - LM Studio models directory exists
-- Hard-link filesystem/volume compatibility
-- Hard-link permission on blobs (a real link is created and removed again, catching restrictions such as Linux `fs.protected_hardlinks`)
+- Default link mode: which mode sync will use without a flag, and why. A real link is created and removed again (even before StudioLink's directories exist), catching different volumes, btrfs subvolumes, and Linux `fs.protected_hardlinks`
 - LM Studio model inventory (`lms ls --json`; required to verify projector bundles)
 - Discovered Ollama models
 - Blob presence validation
@@ -212,7 +213,7 @@ Default paths are platform-aware; every one can be overridden with an environmen
 |---------|-----------------|---------------|---------------|---------------------|
 | Ollama executable | `ollama` from `PATH`, then the standard app path | `ollama` from `PATH` (fallback `/usr/bin/ollama`) | `ollama` from `PATH` (fallback `/usr/bin/ollama`) | `STUDIOLINK_OLLAMA_EXE` |
 | LM Studio CLI | `lms` from `PATH`, then `~\.lmstudio\bin\lms.exe` | `lms` from `PATH` (fallback `~/.lmstudio/bin/lms`) | `lms` from `PATH` (fallback `~/.lmstudio/bin/lms`) | `STUDIOLINK_LMS_EXE` |
-| Ollama models | `~\.ollama\models` | `/usr/share/ollama/.ollama/models` | `~/.ollama/models` | `STUDIOLINK_OLLAMA_MODELS_DIR` (falls back to Ollama's own `OLLAMA_MODELS`) |
+| Ollama models | `~\.ollama\models` | First existing of: the `ollama` systemd unit's `OLLAMA_MODELS`, `/usr/share/ollama/.ollama/models` (official installer), `/var/lib/ollama` (Arch/CachyOS package), `~/.ollama/models` | `~/.ollama/models` | `STUDIOLINK_OLLAMA_MODELS_DIR` (falls back to Ollama's own `OLLAMA_MODELS`) |
 | LM Studio models | LM Studio's configured `downloadsFolder` | LM Studio's configured `downloadsFolder` | LM Studio's configured `downloadsFolder` | `STUDIOLINK_LMSTUDIO_MODELS_DIR` |
 | State directory | `~\.studiolink` | `~/.studiolink` | `~/.studiolink` | `STUDIOLINK_STATE_DIR` |
 
@@ -240,14 +241,17 @@ ollama pull <model-name>
 ### "Ollama MLX (safetensors) models are not supported"
 The model only has an MLX build in Ollama (common on Apple Silicon), which has no GGUF file for LM Studio to import. Pull a GGUF variant of the model, or download it in LM Studio directly.
 
-### Hard link fails (cross-volume)
-Hard links require the Ollama blob store, the StudioLink state directory, and the LM Studio models directory to live on the same filesystem/volume. If they don't, the sync reports a hard-link error; retry with copy mode instead:
+### Hard link fails
+Hard links need the Ollama blob store, the StudioLink state directory, and the LM Studio models directory on the same filesystem - and on Linux, separate btrfs subvolumes (such as CachyOS's default `@` and `@home`) count as different filesystems. When Ollama runs as a system service, its blobs belong to the `ollama` user and `fs.protected_hardlinks` also blocks linking them.
 
-```powershell
-sdl sync <model-name> --copy
+Without a mode flag, sync detects this and uses symbolic links instead; `sdl doctor` shows the mode it will pick. If you passed `--hard-link`, drop it or choose another mode:
+
+```sh
+sdl sync <model-name> --symbolic-link   # no extra disk space; breaks if Ollama deletes the model
+sdl sync <model-name> --copy            # full copy; independent of Ollama
 ```
 
-Copy mode creates its temporary naming alias on Ollama's filesystem, so the state directory and LM Studio library may live on other volumes without requiring symbolic-link permission. Symbolic-link mode uses a symlink for cross-volume staging and requires permission to create symlinks on Windows.
+Copy mode creates its temporary naming alias on Ollama's filesystem when it can, and otherwise uses a symbolic link in StudioLink's own directory. Symbolic-link mode requires permission to create symlinks on Windows (Developer Mode).
 
 ### Deleted a model in Ollama but disk space wasn't freed
 Both LM Studio imports and StudioLink staging aliases can keep a deleted Ollama blob alive. Run `sdl prune --dry-run` to preview cleanup, then `sdl prune` to remove the obsolete managed files. Untracked LM Studio files may still hold links and need separate inspection.
@@ -261,8 +265,8 @@ Run `sdl doctor` to verify:
 ## Design Notes
 
 - **Ollama as source of truth** - StudioLink never changes Ollama manifests or content-addressed blobs; copy mode may briefly create a `.studiolink-imports` alias directory on the same filesystem
-- **Hard links by default** - Space-efficient, creates references rather than copies
-- **No silent fallbacks** - If a hard link is impossible (cross-volume), the sync fails loudly; use `--copy` explicitly
+- **Hard links when possible** - Space-efficient, creates references rather than copies
+- **No silent fallbacks** - An explicit mode flag never falls back; it fails with a hint. Without a flag, sync prints the mode it picked and why
 - **State persistence** - Tracks and verifies actual imports to avoid redundant operations; state is written atomically and corrupt records are skipped. Verified existing files can restore lost state.
 - **Copy deduplication** - Tags with identical weights share one destination copy through hard links when the destination filesystem supports them.
 - **Dry runs** - Preview sync actions without replacing aliases or invoking an import.

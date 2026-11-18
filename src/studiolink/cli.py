@@ -206,6 +206,14 @@ def run_scan(args: argparse.Namespace, service: StudioLinkService) -> int:
 def run_sync(args: argparse.Namespace, service: StudioLinkService) -> int:
     mode = _resolve_link_mode(args)
     import_mode = ImportMode.DIRECT if args.direct else ImportMode.ALIAS
+    if mode is None and not args.json:
+        automatic, reason = service.default_link_mode()
+        if automatic is not LinkMode.HARD_LINK:
+            # Never fall back silently: say which mode was picked and why.
+            print(
+                f"Using {automatic} for new imports: {reason}. "
+                "Pass --copy or --symbolic-link to choose explicitly."
+            )
     results = service.sync(
         model_names=args.models,
         sync_all=bool(args.all),

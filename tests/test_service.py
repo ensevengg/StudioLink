@@ -1,5 +1,4 @@
 import os
-import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,7 +10,7 @@ from conftest import (
     write_manifest,
 )
 
-import studiolink.service as service_module
+import studiolink.files as files_module
 from studiolink.lmstudio_adapter import LMStudioError
 from studiolink.models import LinkMode
 from studiolink.ollama_adapter import OllamaAdapter
@@ -33,52 +32,67 @@ def replace_primary(record, **changes):
     )
 
 
-class TestDoctorVolumeCheck:
-    def test_same_device_passes(self, make_config, fake_lmstudio):
-        config = make_config()
-        for directory in (
-            config.ollama_blobs_dir,
-            config.import_staging_dir,
-            config.lmstudio_models_dir,
-        ):
-            directory.mkdir(parents=True)
-        service = build_service(config, fake_lmstudio)
+def denied_hard_links(monkeypatch):
+    def denied(source, target, *args, **kwargs):
+        raise OSError(18, "Invalid cross-device link")
 
-        check = service._volume_compatibility_check()
+    monkeypatch.setattr(files_module.os, "link", denied)
+
+
+class TestDefaultLinkMode:
+    def ready_service(self, make_config, fake_lmstudio):
+        config = make_config()
+        write_manifest(config, digest=DIGEST_A)
+        write_blob(config, DIGEST_A)
+        config.lmstudio_models_dir.mkdir(parents=True)
+        return config, build_service(config, fake_lmstudio)
+
+    def test_hard_link_when_linkable(self, make_config, fake_lmstudio):
+        config, service = self.ready_service(make_config, fake_lmstudio)
+
+        check = next(c for c in service.doctor() if c.name == "default link mode")
 
         assert check.ok is True
-        assert "device" in check.details
+        assert check.details.startswith("hard-link")
+        leftovers = [
+            p for p in config.lmstudio_models_dir.parent.rglob(".studiolink-probe-*")
+        ]
+        assert leftovers == []
 
-    def test_mismatched_devices_fail(self, make_config, fake_lmstudio, monkeypatch):
-        config = make_config()
-        for directory in (
-            config.ollama_blobs_dir,
-            config.import_staging_dir,
-            config.lmstudio_models_dir,
-        ):
-            directory.mkdir(parents=True)
-        service = build_service(config, fake_lmstudio)
+    def test_probes_before_staging_directory_exists(
+        self, make_config, fake_lmstudio, monkeypatch
+    ):
+        # First run: ~/.studiolink/imports doesn't exist yet. The probe must
+        # still run (in its parent) rather than report "skipped".
+        config, service = self.ready_service(make_config, fake_lmstudio)
+        assert not config.import_staging_dir.exists()
+        denied_hard_links(monkeypatch)
 
-        real_stat = os.stat
-        devices = {}
+        check = next(c for c in service.doctor() if c.name == "default link mode")
 
-        def fake_stat(path, *args, **kwargs):
-            real_stat(path, *args, **kwargs)
-            key = str(path)
-            if key not in devices:
-                devices[key] = len(devices) + 1
-            return types.SimpleNamespace(st_dev=devices[key])
+        assert check.ok is True
+        assert check.details.startswith("symbolic-link")
+        assert "cross-device" in check.details
+        assert "--hard-link would fail" in check.details
+        assert not config.import_staging_dir.exists()
 
-        monkeypatch.setattr(service_module.os, "stat", fake_stat)
-        check = service._volume_compatibility_check()
+    def test_copy_when_symlinks_also_fail(
+        self, make_config, fake_lmstudio, monkeypatch
+    ):
+        _, service = self.ready_service(make_config, fake_lmstudio)
+        denied_hard_links(monkeypatch)
 
-        assert check.ok is False
+        def no_symlinks(self, target, *args, **kwargs):
+            raise OSError(1, "A required privilege is not held by the client")
 
-    def test_skips_when_directories_missing(self, make_config, fake_lmstudio):
+        monkeypatch.setattr(Path, "symlink_to", no_symlinks)
+
+        assert service.default_link_mode()[0] is LinkMode.COPY
+
+    def test_no_blobs_defaults_to_hard_link(self, make_config, fake_lmstudio):
         service = build_service(make_config(), fake_lmstudio)
-        check = service._volume_compatibility_check()
-        assert check.ok is True
-        assert "skipped" in check.details
+
+        assert service.default_link_mode()[0] is LinkMode.HARD_LINK
 
     def test_doctor_accepts_import_directory_that_has_not_been_created_yet(
         self, make_config, fake_lmstudio
@@ -94,20 +108,6 @@ class TestDoctorVolumeCheck:
         aliases = next(c for c in checks if c.name == "import alias directory")
         assert aliases.ok is True
         assert "will be created" in aliases.details
-
-    def test_doctor_includes_volume_check(self, make_config, fake_lmstudio):
-        config = make_config()
-        for directory in (
-            config.ollama_blobs_dir,
-            config.import_staging_dir,
-            config.lmstudio_models_dir,
-        ):
-            directory.mkdir(parents=True)
-        service = build_service(config, fake_lmstudio)
-
-        checks = service.doctor()
-        volume = next(c for c in checks if c.name == "hard-link volume compatibility")
-        assert volume.ok is True
 
 
 class TestPrune:
@@ -568,61 +568,7 @@ class TestStatusInventoryDegradation:
         assert entry.synced is True
 
 
-class TestDoctorHardLinkPermission:
-    def test_probe_passes_on_linkable_filesystem(self, make_config, fake_lmstudio):
-        config = make_config()
-        write_manifest(config, digest=DIGEST_A)
-        write_blob(config, DIGEST_A)
-        config.import_staging_dir.mkdir(parents=True)
-        service = build_service(config, fake_lmstudio)
-
-        checks = service.doctor()
-
-        check = next(c for c in checks if c.name == "hard-link permission on blobs")
-        assert check.ok is True
-        assert "ok" in check.details
-        assert not any(
-            probe.name.startswith(".studiolink-probe-")
-            for probe in config.import_staging_dir.iterdir()
-        )
-
-    def test_probe_reports_unlinkable_blobs(
-        self, make_config, fake_lmstudio, monkeypatch
-    ):
-        config = make_config()
-        write_manifest(config, digest=DIGEST_A)
-        write_blob(config, DIGEST_A)
-        config.import_staging_dir.mkdir(parents=True)
-        service = build_service(config, fake_lmstudio)
-
-        def denied(source, target, *args, **kwargs):
-            raise PermissionError(1, "Operation not permitted")
-
-        monkeypatch.setattr(service_module.os, "link", denied)
-
-        checks = service.doctor()
-
-        check = next(c for c in checks if c.name == "hard-link permission on blobs")
-        assert check.ok is False
-        assert "FAILED" in check.details
-        assert "fs.protected_hardlinks" in check.details
-
-    def test_probe_skips_without_blobs(self, make_config, fake_lmstudio):
-        config = make_config()
-        for directory in (
-            config.ollama_manifests_dir,
-            config.ollama_blobs_dir,
-            config.lmstudio_models_dir,
-        ):
-            directory.mkdir(parents=True)
-        service = build_service(config, fake_lmstudio)
-
-        checks = service.doctor()
-
-        check = next(c for c in checks if c.name == "hard-link permission on blobs")
-        assert check.ok is True
-        assert "skipped" in check.details
-
+class TestDoctorInventory:
     def test_doctor_checks_lm_studio_inventory(self, make_config, fake_lmstudio):
         config = make_config()
         config.ollama_manifests_dir.mkdir(parents=True)
@@ -659,3 +605,39 @@ class TestPruneSweepsCopyStaging:
         removed = {result.path for result in report.aliases if result.removed}
         assert removed == {leftover, healthy}
         assert blob.stat().st_nlink == 1
+
+
+class TestRemoveEmptyParents:
+    def test_removes_empty_repository_folders_but_not_root(self, tmp_path):
+        root = tmp_path / "models"
+        file = root / "ollama" / "qwen3" / "model.gguf"
+        file.parent.mkdir(parents=True)
+        file.write_bytes(b"x")
+        file.unlink()
+
+        files_module.remove_empty_parents(file, root)
+
+        assert root.is_dir()
+        assert not (root / "ollama").exists()
+
+    def test_keeps_folders_with_other_models(self, tmp_path):
+        root = tmp_path / "models"
+        file = root / "ollama" / "qwen3" / "model.gguf"
+        other = root / "ollama" / "llama3" / "model.gguf"
+        for path in (file, other):
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x")
+        file.unlink()
+
+        files_module.remove_empty_parents(file, root)
+
+        assert not file.parent.exists()
+        assert other.is_file()
+
+    def test_ignores_paths_outside_root(self, tmp_path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+
+        files_module.remove_empty_parents(staging / "alias.gguf", tmp_path / "models")
+
+        assert staging.is_dir()
