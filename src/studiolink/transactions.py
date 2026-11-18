@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -14,6 +15,8 @@ from pathlib import Path
 
 from studiolink.models import PruneResult
 from studiolink.state import StateStore
+
+logger = logging.getLogger("studiolink")
 
 TRANSACTIONS = ".studiolink-transactions"
 # errno values meaning "this filesystem cannot hard-link"; Windows reports
@@ -46,8 +49,40 @@ def _cleanup(work: Path, filename: str) -> None:
 
 
 def _remove_empty(work: Path) -> None:
-    (work / "lock.json.lock").unlink(missing_ok=True)
-    work.rmdir()
+    """Remove a finished transaction directory, but never files we didn't create.
+
+    An unexpected leftover (say, a partial file from an interrupted ``lms``)
+    must not abort every later sync or prune; it is left for the user, and
+    ``sdl doctor`` lists it via :func:`leftover_transactions`.
+    """
+    try:
+        (work / "lock.json.lock").unlink(missing_ok=True)
+        work.rmdir()
+    except OSError as exc:
+        logger.warning(
+            "Left unexpected files in %s (%s); inspect and delete them by hand",
+            work,
+            exc.strerror or exc,
+        )
+
+
+def leftover_transactions(models: Path) -> list[Path]:
+    """Transaction directories that recovery could not clean up."""
+    try:
+        root = _root(models)
+        if not root.is_dir():
+            return []
+        return sorted(
+            work
+            for work in root.iterdir()
+            if work.is_dir()
+            and not work.is_symlink()
+            and work.name.startswith("import-")
+            and not (work / MARKER).exists()
+            and any(entry.name != "lock.json.lock" for entry in work.iterdir())
+        )
+    except (OSError, RuntimeError):
+        return []
 
 
 def recover_imports(models: Path, *, dry_run: bool = False) -> tuple[PruneResult, ...]:

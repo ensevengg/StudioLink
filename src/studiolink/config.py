@@ -63,6 +63,21 @@ def _has_ollama_store(path: Path) -> bool:
     )
 
 
+def _has_ollama_models(path: Path) -> bool:
+    """Whether the store holds at least one named manifest.
+
+    The service creates empty store directories the first time it starts, so
+    an empty store must never win over one that really holds the user's models.
+    """
+    for name in ("manifests-v2", "manifests"):
+        root = path / name
+        if root.is_dir():
+            for entry in root.rglob("*"):
+                if entry.is_file() or entry.is_symlink():
+                    return True
+    return False
+
+
 def _default_ollama_models_dir(home: Path) -> Path:
     if not sys.platform.startswith("linux"):
         return home / ".ollama" / "models"
@@ -72,12 +87,13 @@ def _default_ollama_models_dir(home: Path) -> Path:
         *LINUX_OLLAMA_MODELS_DIRS,
         home / ".ollama" / "models",
     ]
-    for candidate in candidates:
-        try:
-            if _has_ollama_store(candidate):
-                return candidate
-        except OSError:
-            continue
+    for present in (_has_ollama_models, _has_ollama_store):
+        for candidate in candidates:
+            try:
+                if present(candidate):
+                    return candidate
+            except OSError:
+                continue
     return candidates[0]
 
 

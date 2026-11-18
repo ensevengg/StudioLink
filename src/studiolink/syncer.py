@@ -99,16 +99,19 @@ class Syncer:
         for model in models:
             mode = link_mode
             existing = records.get(model.canonical_name)
-            if (
-                keep_existing_mode
-                and existing is not None
-                and is_synced(model, existing, self.config.lmstudio_models_dir)
-            ):
+            # Checked once per model: for a legacy copy record without a saved
+            # identity this compares the whole file.
+            synced = existing is not None and is_synced(
+                model, existing, self.config.lmstudio_models_dir
+            )
+            if keep_existing_mode and existing is not None and synced:
                 # Without an explicit flag, a working import keeps its mode
                 # instead of being converted to whatever the probe picked.
                 mode = existing.link_mode
             try:
-                result = self._sync_one(model, records, mode, import_mode, dry_run)
+                result = self._sync_one(
+                    model, records, mode, import_mode, dry_run, synced=synced
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 result = SyncResult(model=model, status="error", message=str(exc))
             results.append(result)
@@ -129,6 +132,8 @@ class Syncer:
         link_mode: LinkMode,
         import_mode: ImportMode,
         dry_run: bool,
+        *,
+        synced: bool | None = None,
     ) -> SyncResult:
         logger.debug(
             "Processing model: %s (readiness=%s)",
@@ -138,11 +143,9 @@ class Syncer:
         root = self.config.lmstudio_models_dir
         existing = records.get(model.canonical_name)
         sources = model_artifacts(model)
-        if (
-            existing is not None
-            and is_synced(model, existing, root)
-            and existing.link_mode is link_mode
-        ):
+        if synced is None:
+            synced = existing is not None and is_synced(model, existing, root)
+        if existing is not None and synced and existing.link_mode is link_mode:
             logger.debug("Model %s is already synced, skipping", model.canonical_name)
             verified = self._verified_record(existing, sources)
             message = "imported file verified; already synced"
@@ -343,7 +346,9 @@ class Syncer:
                         link_mode=link_mode,
                         dry_run=False,
                     )
-                if not healthy_destination(target, blob, link_mode):
+                if not healthy_destination(
+                    target, blob, link_mode, compare_contents=False
+                ):
                     raise RuntimeError(
                         f"LM Studio did not create the expected {link_mode} import at {target}; "
                         "check that STUDIOLINK_LMSTUDIO_MODELS_DIR matches LM Studio's models directory"

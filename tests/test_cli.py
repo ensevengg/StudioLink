@@ -251,6 +251,7 @@ class TestPruneCommand:
             "aliases": [],
             "imports": [],
             "records_removed": [],
+            "records_kept": [],
         }
 
     def test_prune_reports_aliases(self, fake_service, monkeypatch, capsys):

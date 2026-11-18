@@ -276,6 +276,13 @@ def run_prune(args: argparse.Namespace, service: StudioLinkService) -> int:
         return 1 if failed else 0
 
     verb = "Would remove" if report.dry_run else "Removed"
+    if report.records_kept:
+        print(
+            f"Kept {len(report.records_kept)} import(s) whose weights still exist "
+            f"outside {service.config.ollama_blobs_dir}: "
+            + ", ".join(report.records_kept)
+            + ". If Ollama moved, set STUDIOLINK_OLLAMA_MODELS_DIR to its store."
+        )
     if not files and not report.records_removed:
         print("Nothing to prune.")
         return 0

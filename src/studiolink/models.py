@@ -444,6 +444,8 @@ class PruneReport:
     aliases: tuple[PruneResult, ...] = ()
     records_removed: tuple[str, ...] = ()
     imports: tuple[PruneResult, ...] = ()
+    # Missing from the scanned store, but their blobs still exist elsewhere.
+    records_kept: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -451,4 +453,5 @@ class PruneReport:
             "aliases": [item.to_json() for item in self.aliases],
             "imports": [item.to_json() for item in self.imports],
             "records_removed": list(self.records_removed),
+            "records_kept": list(self.records_kept),
         }

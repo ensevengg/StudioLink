@@ -48,6 +48,17 @@ def identity(path: Path) -> tuple[int, int, int, int]:
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
+def matches_identity(path: Path, recorded: tuple[int, int, int, int]) -> bool:
+    """Whether ``path`` is still the file whose identity was recorded.
+
+    The device number is stored but never compared: Linux renumbers devices
+    across reboots (btrfs subvolumes get anonymous ids at mount time, NVMe
+    drives can enumerate in a different order), which would disown every
+    import. Inode, size and nanosecond mtime at a fixed path still pin the file.
+    """
+    return identity(path)[1:] == recorded[1:]
+
+
 def equal_contents(left: Path, right: Path) -> bool:
     """Compare without allocating model-sized buffers or writing more copies."""
     try:
@@ -105,7 +116,7 @@ def owns_destination(record: SyncRecord, artifact: SyncedArtifact, path: Path) -
 
     try:
         if artifact.imported_identity is not None:
-            return identity(path) == artifact.imported_identity
+            return matches_identity(path, artifact.imported_identity)
         # Legacy records have no file identity. Require evidence before removal.
         if path.is_symlink():
             return link_target(path) == artifact.import_alias_path.absolute()
@@ -120,8 +131,20 @@ def owns_destination(record: SyncRecord, artifact: SyncedArtifact, path: Path) -
 
 
 def healthy_destination(
-    path: Path, blob: Path, mode: LinkMode, artifact: SyncedArtifact | None = None
+    path: Path,
+    blob: Path,
+    mode: LinkMode,
+    artifact: SyncedArtifact | None = None,
+    *,
+    compare_contents: bool = True,
 ) -> bool:
+    """Check an import against its blob.
+
+    For copies without a recorded identity this reads both files in full, so
+    callers that just watched ``lms`` write the copy pass
+    ``compare_contents=False``: the type and size checks are enough there, and
+    the identity recorded afterwards makes later checks cheap.
+    """
     from studiolink.models import LinkMode
 
     try:
@@ -136,8 +159,8 @@ def healthy_destination(
         if path.stat().st_size != blob.stat().st_size:
             return False
         if artifact is not None and artifact.imported_identity is not None:
-            return identity(path) == artifact.imported_identity
-        return equal_contents(path, blob)
+            return matches_identity(path, artifact.imported_identity)
+        return not compare_contents or equal_contents(path, blob)
     except OSError:
         return False
 
@@ -162,7 +185,7 @@ def intact_destination(
             artifact.imported_identity is not None
             and path.is_file()
             and not path.is_symlink()
-            and identity(path) == artifact.imported_identity
+            and matches_identity(path, artifact.imported_identity)
         )
     except OSError:
         return False

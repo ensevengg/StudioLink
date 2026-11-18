@@ -48,6 +48,15 @@ All notable changes to StudioLink are documented here. Versions follow
   `fs.protected_hardlinks` or a read-only Ollama store (Linux system service).
 - `--hard-link` failures explain why and suggest another mode.
 - Prune removes the empty LM Studio folders an import leaves behind.
+- Imports stay recognised when Linux renumbers devices across reboots (btrfs
+  subvolumes, NVMe enumeration order).
+- On Linux, a store that holds models wins over an empty one the Ollama
+  service created, and `sdl prune` keeps imports whose weights still exist in
+  another Ollama store instead of deleting them.
+- Copy imports are no longer read back in full after copying; 0.2.0 copy
+  records are compared once and then remembered.
+- Leftover files from an interrupted import no longer abort sync or prune;
+  `sdl doctor` lists them.
 - `status` degrades gracefully when a library is unavailable; state writes are
   durable and tolerate a UTF-8 BOM.
 

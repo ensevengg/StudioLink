@@ -34,7 +34,7 @@ from studiolink.models import (
 from studiolink.ollama_adapter import OllamaAdapter
 from studiolink.state import StateStore
 from studiolink.syncer import Syncer, bundle_is_indexed, same_file
-from studiolink.transactions import recover_imports
+from studiolink.transactions import leftover_transactions, recover_imports
 
 if TYPE_CHECKING:
     from studiolink.ports import LMStudioPort, OllamaPort
@@ -194,13 +194,39 @@ class StudioLinkService:
             wanted = {(a.role, a.digest) for a in model_artifacts(model)}
             return any((a.role, a.digest) not in wanted for a in record.artifacts)
 
+        blobs_dir = self.config.ollama_blobs_dir.resolve()
+
+        def in_other_store(record: SyncRecord) -> bool:
+            # A model missing from this store whose blob still exists in
+            # another one means StudioLink is looking at the wrong store (e.g.
+            # an empty system-service store next to the user's own); deleting
+            # its imports would be wrong.
+            for artifact in record.artifacts:
+                try:
+                    if (
+                        artifact.blob_path.parent.resolve() != blobs_dir
+                        and artifact.blob_path.is_file()
+                    ):
+                        return True
+                except OSError:
+                    continue
+            return False
+
+        kept = sorted(
+            name
+            for name, record in records.items()
+            if name not in current and in_other_store(record)
+        )
         stale = {
             name: record
             for name, record in records.items()
-            if name not in current
-            or (
-                current[name].readiness is ModelReadiness.READY
-                and superseded(record, current[name])
+            if name not in kept
+            and (
+                name not in current
+                or (
+                    current[name].readiness is ModelReadiness.READY
+                    and superseded(record, current[name])
+                )
             )
         }
         protected_aliases = {
@@ -362,6 +388,7 @@ class StudioLinkService:
             aliases=tuple(aliases),
             imports=tuple(imports),
             records_removed=tuple(sorted(removed_names)),
+            records_kept=tuple(kept),
         )
 
     def doctor(self) -> list[DoctorCheck]:
@@ -394,6 +421,7 @@ class StudioLinkService:
                 str(self.config.lmstudio_models_dir),
             ),
             self._link_mode_check(),
+            self._leftover_transactions_check(),
         ]
 
         try:
@@ -485,6 +513,18 @@ class StudioLinkService:
         checks.append(alias_check)
 
         return checks
+
+    def _leftover_transactions_check(self) -> DoctorCheck:
+        leftovers = leftover_transactions(self.config.lmstudio_models_dir)
+        if not leftovers:
+            return DoctorCheck("interrupted imports", True, "none left behind")
+        return DoctorCheck(
+            "interrupted imports",
+            False,
+            "unexpected files remain in "
+            + ", ".join(str(path) for path in leftovers)
+            + "; inspect and delete them by hand",
+        )
 
     def _link_mode_check(self) -> DoctorCheck:
         """Report which import mode sync will use without a flag.

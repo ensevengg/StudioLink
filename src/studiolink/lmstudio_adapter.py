@@ -163,7 +163,9 @@ class LMStudioAdapter:
                     exc.stderr,
                 ) from exc
             if not dry_run:
-                if not healthy_destination(staged, source, link_mode):
+                if not healthy_destination(
+                    staged, source, link_mode, compare_contents=False
+                ):
                     raise LMStudioError(
                         f"LM Studio produced an invalid {link_mode} import",
                         command,
