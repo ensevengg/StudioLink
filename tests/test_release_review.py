@@ -244,6 +244,15 @@ class TestCorruptStateFile:
         assert backup.read_text() == "{ not json"
         assert "llama3:1b" in json.loads(config.state_file.read_text())["sync_records"]
 
+    def test_non_object_records_are_kept_aside_too(self, library):
+        config, service, _, _, _ = library
+        self.corrupt(config, '{"sync_records": ["legacy-junk"]}')
+
+        assert service.sync(sync_all=True)[0].status == "synced"
+
+        [backup] = self.backups(config)
+        assert "legacy-junk" in backup.read_text()
+
     def test_read_only_commands_leave_it_in_place(self, library):
         # An unlocked reader racing a sync must never move the file aside.
         config, service, _, _, _ = library
@@ -359,3 +368,21 @@ class TestReclaimKeepsUserSymlinkTargets:
         assert old.exists()
         with pytest.raises(RuntimeError, match="Could not scan"):
             service.prune()
+
+
+class TestPruneExplainsKeptFiles:
+    def test_link_to_studiolink_folder_keeps_files_and_says_why(self, library, caplog):
+        config, service, _, manifest, _ = library
+        service.sync(sync_all=True, link_mode=LinkMode.COPY)
+        old = next(config.lmstudio_models_dir.rglob("*.gguf"))
+        (config.lmstudio_models_dir / "ollama-link").symlink_to(
+            config.lmstudio_models_dir / "ollama", target_is_directory=True
+        )
+        manifest.unlink()
+
+        with caplog.at_level(logging.WARNING, logger="studiolink"):
+            report = service.prune()
+
+        assert old.exists()
+        assert report.records_removed == ()
+        assert f"Keeping {old}" in caplog.text

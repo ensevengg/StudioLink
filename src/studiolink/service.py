@@ -272,6 +272,11 @@ class StudioLinkService:
             # Never break a symlink that still depends on this entry, whether
             # it is a staging alias or a managed LM Studio destination.
             if references.protects(path, removed=seen):
+                logger.warning(
+                    "Keeping %s: a symbolic link in LM Studio still points to it "
+                    "or to its folder",
+                    path,
+                )
                 return False
             if path in seen:
                 return True

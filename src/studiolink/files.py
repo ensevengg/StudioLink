@@ -271,7 +271,8 @@ class SymlinkReferences:
     """Every link under the LM Studio models directory, keyed by what it targets."""
 
     def __init__(self, root: Path) -> None:
-        self.root = _canonical(root)
+        self._keys: dict[Path, Path] = {}
+        self.root = self._key(root)
         self.errors: list[str] = []
         self._targets: dict[Path, set[Path]] = {}
 
@@ -283,7 +284,7 @@ class SymlinkReferences:
                 path = Path(directory) / name
                 try:
                     if _is_link(path):
-                        target = _canonical(link_target(path))
+                        target = self._key(link_target(path))
                         self._targets.setdefault(target, set()).add(path)
                 except OSError as exc:
                     note(exc)
@@ -294,8 +295,8 @@ class SymlinkReferences:
         A link to a directory that holds ``path`` counts too, as long as that
         directory is below the models root.
         """
-        gone = {_canonical(p) for p in removed}
-        key = _canonical(path)
+        gone = {self._key(p) for p in removed}
+        key = self._key(path)
         candidates = [key]
         candidates.extend(
             parent
@@ -303,10 +304,17 @@ class SymlinkReferences:
             if parent != self.root and parent.is_relative_to(self.root)
         )
         return any(
-            _canonical(link) not in gone and _is_link(link)
+            self._key(link) not in gone and _is_link(link)
             for candidate in candidates
             for link in self._targets.get(candidate, ())
         )
+
+    def _key(self, path: Path) -> Path:
+        # Cached: prune asks about a growing set of removed paths per call.
+        key = self._keys.get(path)
+        if key is None:
+            key = self._keys[path] = _canonical(path)
+        return key
 
 
 def symlink_references(root: Path, *, strict: bool = True) -> SymlinkReferences:

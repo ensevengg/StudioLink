@@ -64,7 +64,7 @@ All notable changes to StudioLink are documented here. Versions follow
   symbolic link or Windows junction you made still points to, including links
   to its folder and links spelled through the real path of a relocated models
   directory. If the models directory cannot be fully scanned, the old file is
-  kept and prune refuses to run.
+  kept and prune refuses to run. Prune says which files it kept and why.
 - `status` degrades gracefully when a library is unavailable; state writes are
   durable and tolerate a UTF-8 BOM.
 

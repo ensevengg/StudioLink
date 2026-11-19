@@ -133,7 +133,8 @@ class StateStore:
         if self._corrupt is None:
             return
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}-{os.getpid()}")
+        unique = f"{os.getpid()}-{time.monotonic_ns()}"
+        backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}-{unique}")
         try:
             os.replace(self.path, backup)
         except FileNotFoundError:
@@ -168,7 +169,9 @@ class StateStore:
         if not isinstance(payload, dict):
             return self._unreadable("expected a JSON object")
         records = payload.get("sync_records", {})
-        return records if isinstance(records, dict) else {}
+        if not isinstance(records, dict):
+            return self._unreadable("expected sync_records to be a JSON object")
+        return records
 
     def _unreadable(self, problem: str) -> dict[str, object]:
         self._corrupt = problem
