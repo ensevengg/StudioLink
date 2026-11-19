@@ -57,6 +57,10 @@ All notable changes to StudioLink are documented here. Versions follow
   records are compared once and then remembered.
 - Leftover files from an interrupted import no longer abort sync or prune;
   `sdl doctor` lists them.
+- An unreadable `state.json` is saved as `state.json.corrupt-<time>` instead
+  of being overwritten; if it cannot be moved aside, StudioLink refuses to save.
+- Replacing a re-pulled model keeps the old LM Studio file when a symbolic link
+  you made still points to it.
 - `status` degrades gracefully when a library is unavailable; state writes are
   durable and tolerate a UTF-8 BOM.
 

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from studiolink.models import LinkMode, OllamaArtifact, SyncedArtifact, SyncRecord
+
+logger = logging.getLogger("studiolink")
 
 
 def link_target(path: Path) -> Path:
@@ -206,6 +209,16 @@ def remove_empty_parents(path: Path, root: Path) -> None:
 def remove_import(
     record: SyncRecord, root: Path, staging: Path, *, keep: set[Path]
 ) -> None:
+    """Remove an import's files, sparing any a user's own symlink still needs."""
+    references = symlink_references(root)
+    removed: set[Path] = set()
+
+    def referenced(path: Path) -> bool:
+        return any(
+            ref.absolute() not in removed and ref.is_symlink()
+            for ref in references.get(path.absolute(), ())
+        )
+
     for artifact in record.artifacts:
         path = artifact_destination(record, artifact, root)
         if path not in keep and (path.exists() or path.is_symlink()):
@@ -213,13 +226,21 @@ def remove_import(
                 raise RuntimeError(
                     f"Refusing to remove a changed or unverified import: {path}"
                 )
+            if referenced(path):
+                # A symlink StudioLink did not make still points here; deleting
+                # it could destroy the last copy of the weights.
+                logger.warning(
+                    "Keeping %s: a symbolic link in LM Studio still points to it",
+                    path,
+                )
+                continue
             path.unlink()
+            removed.add(path.absolute())
             remove_empty_parents(path, root)
-    references = symlink_references(root)
     for artifact in record.artifacts:
         alias = artifact.import_alias_path
         if alias.parent.resolve() == staging.resolve() and alias not in keep:
-            if alias.absolute() not in references:
+            if not referenced(alias):
                 alias.unlink(missing_ok=True)
 
 

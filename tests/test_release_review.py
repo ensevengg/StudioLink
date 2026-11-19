@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from dataclasses import replace
 
 import pytest
@@ -221,3 +222,53 @@ class TestInterruptedTransactions:
         _, service, _, _, _ = library
         check = next(c for c in service.doctor() if c.name == "interrupted imports")
         assert check.ok is True
+
+
+class TestCorruptStateFile:
+    def test_unreadable_state_is_kept_aside(self, library):
+        config, service, _, _, _ = library
+        config.state_file.parent.mkdir(parents=True, exist_ok=True)
+        config.state_file.write_text("{ not json")
+
+        assert service.sync(sync_all=True)[0].status == "synced"
+
+        backups = list(config.state_file.parent.glob("state.json.corrupt-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "{ not json"
+        assert "llama3:1b" in json.loads(config.state_file.read_text())["sync_records"]
+
+    def test_refuses_to_overwrite_when_it_cannot_back_up(self, library, monkeypatch):
+        config, service, _, _, _ = library
+        config.state_file.parent.mkdir(parents=True, exist_ok=True)
+        config.state_file.write_text("[]")
+        real_replace = os.replace
+
+        def blocked(src, dst):
+            if ".corrupt-" in str(dst):
+                raise PermissionError("read-only")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", blocked)
+
+        with pytest.raises(RuntimeError, match="unreadable state file"):
+            service.sync(sync_all=True)
+        assert config.state_file.read_text() == "[]"
+
+
+class TestReclaimKeepsUserSymlinkTargets:
+    @pytest.mark.parametrize("mode", [LinkMode.COPY, LinkMode.HARD_LINK])
+    def test_repull_keeps_import_a_user_symlink_needs(self, library, mode):
+        config, service, _, _, _ = library
+        service.sync(sync_all=True, link_mode=mode)
+        old = next(config.lmstudio_models_dir.rglob("*.gguf"))
+        mine = config.lmstudio_models_dir / "mine" / "favourite.link"
+        mine.parent.mkdir()
+        mine.symlink_to(old)
+        write_manifest(config, digest=DIGEST_B)
+        write_blob(config, DIGEST_B)
+
+        result = service.sync(sync_all=True, link_mode=mode)[0]
+
+        assert result.status == "synced", result.message
+        assert old.exists() and mine.resolve() == old.resolve()
+        assert len(list(config.lmstudio_models_dir.rglob("*.gguf"))) == 2
