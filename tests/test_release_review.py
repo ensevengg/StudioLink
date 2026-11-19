@@ -371,6 +371,22 @@ class TestReclaimKeepsUserSymlinkTargets:
 
 
 class TestPruneExplainsKeptFiles:
+    @pytest.fixture(params=["real-root", "symlinked-root"])
+    def library(self, request, make_config, tmp_path):
+        overrides = {}
+        if request.param == "symlinked-root":
+            real = tmp_path / "disk" / "models"
+            real.mkdir(parents=True)
+            linked = tmp_path / "lmstudio" / "models"
+            linked.parent.mkdir()
+            linked.symlink_to(real, target_is_directory=True)
+            overrides["lmstudio_models_dir"] = linked
+        config = make_config(**overrides)
+        service = StudioLinkService(config=config, lmstudio=FilesystemLMStudio(config))
+        manifest = write_manifest(config)
+        blob = write_blob(config, DIGEST_A)
+        return config, service, None, manifest, blob
+
     def test_link_to_studiolink_folder_keeps_files_and_says_why(self, library, caplog):
         config, service, _, manifest, _ = library
         service.sync(sync_all=True, link_mode=LinkMode.COPY)
@@ -386,3 +402,16 @@ class TestPruneExplainsKeptFiles:
         assert old.exists()
         assert report.records_removed == ()
         assert f"Keeping {old}" in caplog.text
+
+    def test_kept_alias_is_reported_once(self, library, caplog):
+        config, service, _, manifest, _ = library
+        service.sync(sync_all=True, link_mode=LinkMode.HARD_LINK)
+        [alias] = config.import_staging_dir.iterdir()
+        (config.lmstudio_models_dir / "mine.link").symlink_to(alias)
+        manifest.unlink()
+
+        with caplog.at_level(logging.WARNING, logger="studiolink"):
+            service.prune()
+
+        assert alias.exists()
+        assert caplog.text.count(f"Keeping {alias}") == 1

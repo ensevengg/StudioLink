@@ -272,7 +272,9 @@ class SymlinkReferences:
 
     def __init__(self, root: Path) -> None:
         self._keys: dict[Path, Path] = {}
-        self.root = self._key(root)
+        # The root is fully resolved: entry keys resolve their parents, so a
+        # symlinked models directory must compare in its real spelling too.
+        self.root = Path(os.path.normcase(os.path.realpath(root)))
         self.errors: list[str] = []
         self._targets: dict[Path, set[Path]] = {}
 
@@ -288,6 +290,9 @@ class SymlinkReferences:
                         self._targets.setdefault(target, set()).add(path)
                 except OSError as exc:
                     note(exc)
+            # os.walk skips symlinked folders but enters Windows junctions;
+            # one pointing back up the tree would loop until paths overflow.
+            dirs[:] = [d for d in dirs if not Path(directory, d).is_junction()]
 
     def protects(self, path: Path, *, removed: Collection[Path] = ()) -> bool:
         """Whether a link that still exists depends on ``path``.

@@ -345,6 +345,7 @@ class StudioLinkService:
                     and alias.parent.resolve() == staging_dir.resolve()
                 ):
                     if not remove(alias, "obsolete import alias", aliases):
+                        protected_aliases.add(alias)
                         reclaimed = False
             if reclaimed:
                 removed_names.append(name)
