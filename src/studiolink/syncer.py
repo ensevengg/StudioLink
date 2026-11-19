@@ -94,6 +94,9 @@ class Syncer:
         if not dry_run:
             recover_imports(self.config.lmstudio_models_dir)
         records = self.state.get_all_records()
+        if not dry_run:
+            # Fail before importing anything if the old file can't be kept.
+            self.state.set_aside_corrupt()
         logger.debug("Loaded %d existing sync record(s)", len(records))
         results: list[SyncResult] = []
         for model in models:

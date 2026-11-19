@@ -16,9 +16,9 @@ logger = logging.getLogger("studiolink")
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        # Set when an unreadable state file could not be moved aside; saving
-        # would then overwrite the only copy of the user's records.
-        self._unrecoverable: str | None = None
+        # Why the state file on disk could not be read, while it is still
+        # there. Saving first moves it aside so the records are never lost.
+        self._corrupt: str | None = None
 
     @contextmanager
     def lock(self):
@@ -107,11 +107,7 @@ class StateStore:
 
     def _save_raw(self, records: Mapping[str, object]) -> None:
         """Persist raw JSON dict to disk atomically and durably."""
-        if self._unrecoverable is not None:
-            raise RuntimeError(
-                f"Refusing to overwrite the unreadable state file {self.path}: "
-                f"{self._unrecoverable}. Move or repair it, then retry."
-            )
+        self.set_aside_corrupt()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps({"schema_version": 2, "sync_records": records}, indent=2)
         # A per-process temp name keeps concurrent writers from interleaving
@@ -128,44 +124,58 @@ class StateStore:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    def _set_aside(self, problem: str) -> None:
-        """Keep an unreadable state file instead of letting the next save erase it."""
+    def set_aside_corrupt(self) -> None:
+        """Move an unreadable state file aside before anything replaces it.
+
+        Writers call this while holding ``lock()``, so the file moved is the
+        one that was read; read-only commands never move it.
+        """
+        if self._corrupt is None:
+            return
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}-{os.getpid()}")
         try:
             os.replace(self.path, backup)
         except FileNotFoundError:
-            # Another process already moved it aside.
+            self._corrupt = None
             return
         except OSError as exc:
-            self._unrecoverable = f"{problem}; could not back it up: {exc}"
-            logger.error(
-                "Corrupted state file at %s: %s", self.path, self._unrecoverable
-            )
-            return
+            raise RuntimeError(
+                f"Refusing to overwrite the unreadable state file {self.path} "
+                f"({self._corrupt}): could not back it up: {exc}. "
+                "Move or repair it, then retry."
+            ) from exc
         logger.warning(
-            "Corrupted state file at %s: %s. Saved it as %s and starting fresh; "
-            "already-imported models will be re-imported.",
+            "Corrupted state file at %s: %s. Saved it as %s and starting with "
+            "no sync records.",
             self.path,
-            problem,
+            self._corrupt,
             backup,
         )
+        self._corrupt = None
 
     def _load_raw(self) -> dict[str, object]:
         """Load raw JSON dict from disk."""
-        if not self.path.exists():
-            self._unrecoverable = None
-            return {}
+        self._corrupt = None
         try:
             # utf-8-sig tolerates editors that save the file with a BOM;
             # a strict read would discard every record as "corrupted".
             payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            return {}
         except (json.JSONDecodeError, UnicodeError) as exc:
-            self._set_aside(str(exc))
-            return {}
+            return self._unreadable(str(exc))
         if not isinstance(payload, dict):
-            self._set_aside("expected a JSON object")
-            return {}
-        self._unrecoverable = None
+            return self._unreadable("expected a JSON object")
         records = payload.get("sync_records", {})
         return records if isinstance(records, dict) else {}
+
+    def _unreadable(self, problem: str) -> dict[str, object]:
+        self._corrupt = problem
+        logger.warning(
+            "Corrupted state file at %s: %s. Treating it as empty; the next sync "
+            "or prune keeps a backup before saving.",
+            self.path,
+            problem,
+        )
+        return {}

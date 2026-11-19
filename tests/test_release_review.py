@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from conftest import DIGEST_A, DIGEST_B, FakeLMStudio, write_blob, write_manifest
@@ -225,22 +226,41 @@ class TestInterruptedTransactions:
 
 
 class TestCorruptStateFile:
+    def corrupt(self, config, text="{ not json"):
+        config.state_file.parent.mkdir(parents=True, exist_ok=True)
+        config.lmstudio_models_dir.mkdir(parents=True, exist_ok=True)
+        config.state_file.write_text(text)
+
+    def backups(self, config):
+        return list(config.state_file.parent.glob("state.json.corrupt-*"))
+
     def test_unreadable_state_is_kept_aside(self, library):
         config, service, _, _, _ = library
-        config.state_file.parent.mkdir(parents=True, exist_ok=True)
-        config.state_file.write_text("{ not json")
+        self.corrupt(config)
 
         assert service.sync(sync_all=True)[0].status == "synced"
 
-        backups = list(config.state_file.parent.glob("state.json.corrupt-*"))
-        assert len(backups) == 1
-        assert backups[0].read_text() == "{ not json"
+        [backup] = self.backups(config)
+        assert backup.read_text() == "{ not json"
         assert "llama3:1b" in json.loads(config.state_file.read_text())["sync_records"]
 
-    def test_refuses_to_overwrite_when_it_cannot_back_up(self, library, monkeypatch):
+    def test_read_only_commands_leave_it_in_place(self, library):
+        # An unlocked reader racing a sync must never move the file aside.
         config, service, _, _, _ = library
-        config.state_file.parent.mkdir(parents=True, exist_ok=True)
-        config.state_file.write_text("[]")
+        self.corrupt(config)
+
+        service.status()
+        service.sync(sync_all=True, dry_run=True)
+        service.prune(dry_run=True)
+
+        assert self.backups(config) == []
+        assert config.state_file.read_text() == "{ not json"
+
+    def test_refuses_before_importing_when_it_cannot_back_up(
+        self, library, monkeypatch
+    ):
+        config, service, _, _, _ = library
+        self.corrupt(config, "[]")
         real_replace = os.replace
 
         def blocked(src, dst):
@@ -252,11 +272,28 @@ class TestCorruptStateFile:
 
         with pytest.raises(RuntimeError, match="unreadable state file"):
             service.sync(sync_all=True)
+        with pytest.raises(RuntimeError, match="unreadable state file"):
+            service.prune()
         assert config.state_file.read_text() == "[]"
+        assert not any(config.lmstudio_models_dir.rglob("*.gguf"))
+
+    def test_file_vanishing_mid_read_is_empty_state(self, library, monkeypatch):
+        config, service, _, _, _ = library
+        service.sync(sync_all=True)  # the file exists until the read
+
+        def gone(self, *args, **kwargs):
+            raise FileNotFoundError(self)
+
+        monkeypatch.setattr(type(config.state_file), "read_text", gone)
+        assert service.state.get_all_records() == {}
 
 
 class TestReclaimKeepsUserSymlinkTargets:
-    @pytest.mark.parametrize("mode", [LinkMode.COPY, LinkMode.HARD_LINK])
+    def repull(self, config):
+        write_manifest(config, digest=DIGEST_B)
+        write_blob(config, DIGEST_B)
+
+    @pytest.mark.parametrize("mode", list(LinkMode))
     def test_repull_keeps_import_a_user_symlink_needs(self, library, mode):
         config, service, _, _, _ = library
         service.sync(sync_all=True, link_mode=mode)
@@ -264,11 +301,61 @@ class TestReclaimKeepsUserSymlinkTargets:
         mine = config.lmstudio_models_dir / "mine" / "favourite.link"
         mine.parent.mkdir()
         mine.symlink_to(old)
-        write_manifest(config, digest=DIGEST_B)
-        write_blob(config, DIGEST_B)
+        self.repull(config)
 
         result = service.sync(sync_all=True, link_mode=mode)[0]
 
         assert result.status == "synced", result.message
         assert old.exists() and mine.resolve() == old.resolve()
         assert len(list(config.lmstudio_models_dir.rglob("*.gguf"))) == 2
+
+    def test_link_spelled_through_the_real_path(self, make_config, tmp_path):
+        real = tmp_path / "disk" / "models"
+        real.mkdir(parents=True)
+        linked = tmp_path / "lmstudio" / "models"
+        linked.parent.mkdir()
+        linked.symlink_to(real, target_is_directory=True)
+        config = make_config(lmstudio_models_dir=linked)
+        service = StudioLinkService(config=config, lmstudio=FilesystemLMStudio(config))
+        write_manifest(config)
+        write_blob(config, DIGEST_A)
+        service.sync(sync_all=True, link_mode=LinkMode.COPY)
+        old = next(real.rglob("*.gguf"))
+        mine = real / "mine.link"
+        mine.symlink_to(old.resolve())
+        self.repull(config)
+
+        assert service.sync(sync_all=True)[0].status == "synced"
+        assert old.exists()
+
+    def test_directory_link_protects_files_inside(self, library):
+        config, service, _, _, _ = library
+        service.sync(sync_all=True, link_mode=LinkMode.COPY)
+        old = next(config.lmstudio_models_dir.rglob("*.gguf"))
+        mine = config.lmstudio_models_dir / "mine"
+        mine.symlink_to(old.parent, target_is_directory=True)
+        self.repull(config)
+
+        assert service.sync(sync_all=True)[0].status == "synced"
+        assert old.exists()
+
+    def test_unscannable_folder_keeps_old_import_and_sync_succeeds(
+        self, library, monkeypatch
+    ):
+        config, service, _, _, _ = library
+        service.sync(sync_all=True, link_mode=LinkMode.COPY)
+        old = next(config.lmstudio_models_dir.rglob("*.gguf"))
+        real_walk = files_module.os.walk
+
+        def walk(top, onerror=None, **kwargs):
+            if Path(top) == config.lmstudio_models_dir and onerror is not None:
+                onerror(PermissionError(13, "Permission denied", f"{top}/locked"))
+            yield from real_walk(top, onerror=onerror, **kwargs)
+
+        monkeypatch.setattr(files_module.os, "walk", walk)
+        self.repull(config)
+
+        assert service.sync(sync_all=True)[0].status == "synced"
+        assert old.exists()
+        with pytest.raises(RuntimeError, match="Could not scan"):
+            service.prune()

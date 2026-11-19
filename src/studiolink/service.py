@@ -186,6 +186,8 @@ class StudioLinkService:
         models = list(scan.models)
         current = {m.canonical_name: m for m in models}
         records = self.state.get_all_records()
+        if not dry_run:
+            self.state.set_aside_corrupt()
         root = self.config.lmstudio_models_dir
         staging_dir = self.config.import_staging_dir
 
@@ -269,11 +271,7 @@ class StudioLinkService:
         def remove(path, reason, results):
             # Never break a symlink that still depends on this entry, whether
             # it is a staging alias or a managed LM Studio destination.
-            if any(
-                ref.is_symlink()
-                for ref in references.get(path.absolute(), ())
-                if ref not in seen
-            ):
+            if references.protects(path, removed=seen):
                 return False
             if path in seen:
                 return True

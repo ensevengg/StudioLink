@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Collection
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -210,15 +211,18 @@ def remove_import(
     record: SyncRecord, root: Path, staging: Path, *, keep: set[Path]
 ) -> None:
     """Remove an import's files, sparing any a user's own symlink still needs."""
-    references = symlink_references(root)
-    removed: set[Path] = set()
-
-    def referenced(path: Path) -> bool:
-        return any(
-            ref.absolute() not in removed and ref.is_symlink()
-            for ref in references.get(path.absolute(), ())
+    references = symlink_references(root, strict=False)
+    if references.errors:
+        # Without a full scan a user's link could go unseen; leave the old
+        # import in place rather than risk breaking it.
+        logger.warning(
+            "Keeping the previous import of %s: could not scan %s for links (%s)",
+            record.canonical_name,
+            root,
+            "; ".join(references.errors),
         )
-
+        return
+    removed: set[Path] = set()
     for artifact in record.artifacts:
         path = artifact_destination(record, artifact, root)
         if path not in keep and (path.exists() or path.is_symlink()):
@@ -226,7 +230,7 @@ def remove_import(
                 raise RuntimeError(
                     f"Refusing to remove a changed or unverified import: {path}"
                 )
-            if referenced(path):
+            if references.protects(path, removed=removed):
                 # A symlink StudioLink did not make still points here; deleting
                 # it could destroy the last copy of the weights.
                 logger.warning(
@@ -235,27 +239,84 @@ def remove_import(
                 )
                 continue
             path.unlink()
-            removed.add(path.absolute())
+            removed.add(path)
             remove_empty_parents(path, root)
     for artifact in record.artifacts:
         alias = artifact.import_alias_path
         if alias.parent.resolve() == staging.resolve() and alias not in keep:
-            if not referenced(alias):
+            if not references.protects(alias, removed=removed):
                 alias.unlink(missing_ok=True)
 
 
-def symlink_references(root: Path) -> dict[Path, set[Path]]:
-    """Find LM Studio symlinks before deleting aliases, including untracked ones."""
-    references: dict[Path, set[Path]] = {}
+def _is_link(path: Path) -> bool:
+    # Windows junctions are not symlinks to Python, but users make them with
+    # `mklink /J` (no Developer Mode needed) and they break the same way.
+    return path.is_symlink() or path.is_junction()
 
-    def fail(exc: OSError) -> None:
-        raise exc
 
-    for directory, dirs, files in os.walk(root, onerror=fail):
-        for name in (*dirs, *files):
-            path = Path(directory) / name
-            if path.is_symlink():
-                references.setdefault(link_target(path), set()).add(path)
+def _canonical(path: Path) -> Path:
+    """One spelling per entry: real parent directory plus the entry's own name.
+
+    The entry itself is not resolved, because it may be a link we are asking
+    about; resolving every directory above it makes a link spelled through
+    the real path match a destination spelled through a symlinked root.
+    """
+    path = Path(os.path.abspath(path))
+    return Path(
+        os.path.normcase(os.path.join(os.path.realpath(path.parent), path.name))
+    )
+
+
+class SymlinkReferences:
+    """Every link under the LM Studio models directory, keyed by what it targets."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = _canonical(root)
+        self.errors: list[str] = []
+        self._targets: dict[Path, set[Path]] = {}
+
+        def note(exc: OSError) -> None:
+            self.errors.append(str(exc))
+
+        for directory, dirs, files in os.walk(root, onerror=note):
+            for name in (*dirs, *files):
+                path = Path(directory) / name
+                try:
+                    if _is_link(path):
+                        target = _canonical(link_target(path))
+                        self._targets.setdefault(target, set()).add(path)
+                except OSError as exc:
+                    note(exc)
+
+    def protects(self, path: Path, *, removed: Collection[Path] = ()) -> bool:
+        """Whether a link that still exists depends on ``path``.
+
+        A link to a directory that holds ``path`` counts too, as long as that
+        directory is below the models root.
+        """
+        gone = {_canonical(p) for p in removed}
+        key = _canonical(path)
+        candidates = [key]
+        candidates.extend(
+            parent
+            for parent in key.parents
+            if parent != self.root and parent.is_relative_to(self.root)
+        )
+        return any(
+            _canonical(link) not in gone and _is_link(link)
+            for candidate in candidates
+            for link in self._targets.get(candidate, ())
+        )
+
+
+def symlink_references(root: Path, *, strict: bool = True) -> SymlinkReferences:
+    """Find LM Studio links before deleting anything, including untracked ones."""
+    references = SymlinkReferences(root)
+    if strict and references.errors:
+        raise RuntimeError(
+            f"Could not scan {root} for symbolic links, so nothing was removed: "
+            + "; ".join(references.errors)
+        )
     return references
 
 

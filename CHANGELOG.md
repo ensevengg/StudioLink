@@ -57,10 +57,14 @@ All notable changes to StudioLink are documented here. Versions follow
   records are compared once and then remembered.
 - Leftover files from an interrupted import no longer abort sync or prune;
   `sdl doctor` lists them.
-- An unreadable `state.json` is saved as `state.json.corrupt-<time>` instead
-  of being overwritten; if it cannot be moved aside, StudioLink refuses to save.
-- Replacing a re-pulled model keeps the old LM Studio file when a symbolic link
-  you made still points to it.
+- An unreadable `state.json` is kept as `state.json.corrupt-<time>` before
+  sync or prune saves new records; read-only commands leave it alone, and if
+  it cannot be moved aside, sync and prune stop before changing anything.
+- Replacing a re-pulled model, like `sdl prune`, keeps an LM Studio file that a
+  symbolic link or Windows junction you made still points to, including links
+  to its folder and links spelled through the real path of a relocated models
+  directory. If the models directory cannot be fully scanned, the old file is
+  kept and prune refuses to run.
 - `status` degrades gracefully when a library is unavailable; state writes are
   durable and tolerate a UTF-8 BOM.
 
